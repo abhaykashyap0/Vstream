@@ -1,4 +1,4 @@
-# JamStream - MERN Music Streaming App
+# Vstream - MERN Music Streaming App
 
 A full-stack music streaming application built with the MERN stack (MongoDB, Express, React, Node.js) and powered by the Jamendo API.
 
