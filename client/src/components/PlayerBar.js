@@ -1,0 +1,11543 @@
+import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+import { MusicContext } from '../context/MusicContext';
+import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+import axios from 'axios';
+
+const PlayerBar = () => {
+  const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+  // Keep ref always pointing to latest playNext so stale closures in YT callbacks use current repeat state
+  useEffect(() => { playNextRef.current = playNext; }, [playNext]);
+
+  // ONE player — always mounted in the modal container, just hidden/shown
+  const playerRef     = useRef(null);
+  const playerContRef   = useRef(null); // always-present div in modal
+  const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+  const isReady       = useRef(false);
+
+  const [progress, setProgress]           = useState(0);
+  const [volume, setVolume]               = useState(100);
+  const [isMuted, setIsMuted]             = useState(false);
+  const [showModal, setShowModal]         = useState(false);
+  const [isFullscreen, setIsFullscreen]     = useState(false);
+  const [activeTab, setActiveTab]         = useState('video');
+  const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+  const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+  const [lyricsLoading, setLyricsLoading] = useState(false);
+  const [currentLineIndex, setCurrentLineIndex] = useState(0);
+  const [lyricsOffset, setLyricsOffset]         = useState(1.5); // seconds ahead of song
+  const [isTransliterating, setIsTransliterating] = useState(false);
+  const [translitMode, setTranslitMode]           = useState('original'); // 'original' | 'hinglish'
+  const progressInterval = useRef(null);
+  const lyricsOffsetRef  = useRef(1.5);
+  const playNextRef      = useRef(null); // always holds latest playNext to avoid stale closure // mirror of lyricsOffset for use inside setInterval
+
+  const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+  const hasPrev = currentIndex > 0;
+  const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+  // ── Lyrics ─────────────────────────────────────────────────────────────
+  // ── Detect if text has Devanagari (Hindi) characters ─────────────────
+  const hasDevanagari = (text) => /[\u0900-\u097F]/.test(text);
+
+  // ── Transliterate using Claude API ────────────────────────────────────
+  const transliterateToHinglish = async (text) => {
+    setIsTransliterating(true);
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1000,
+          messages: [{
+            role: 'user',
+            content: `Transliterate these Hindi/Devanagari song lyrics to Hinglish (Roman script). 
+Rules:
+- Keep English words/lines exactly as they are
+- Transliterate Hindi words to how they sound in Roman/English letters
+- Keep line breaks exactly the same
+- Do not translate — only transliterate the pronunciation
+- Return ONLY the transliterated lyrics, nothing else
+
+Lyrics:
+${text}`
+          }]
+        })
+      });
+      const data = await response.json();
+      return data.content?.[0]?.text || text;
+    } catch (err) {
+      console.error('Transliteration error:', err);
+      return text;
+    } finally {
+      setIsTransliterating(false);
+    }
+  };
+
+  // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+  const parseSyncedLyrics = (lrc) => {
+    if (!lrc) return [];
+    return lrc.split('\n')
+      .map(line => {
+        const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+        if (!match) return null;
+        const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+        return { time, text: match[3].trim() };
+      })
+      .filter(Boolean);
+  };
+
+  const fetchLyrics = useCallback(async (song) => {
+    if (!song) return;
+    setLyricsLoading(true);
+    setSyncedLines([]);
+    setPlainLyrics('');
+    setCurrentLineIndex(0);
+    setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5;
+    try {
+      // ── Clean title aggressively ───────────────────────────────────
+      const cleanTitle = song.title
+        .replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '')
+        .replace(/\|.*/g, '').replace(/ft\.?.*/gi, '')
+        .replace(/feat\.?.*/gi, '').trim();
+
+      const aggressiveTitle = cleanTitle
+        .replace(/\s*-\s*.*/g, '').replace(/official.*/gi, '')
+        .replace(/lyrics.*/gi, '').replace(/video.*/gi, '')
+        .replace(/hd.*/gi, '').replace(/full\s+song.*/gi, '').trim();
+
+      const cleanArtist = song.artist
+        .replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '')
+        .replace(/official$/i, '').replace(/music$/i, '').trim();
+
+      // ── Score-based best match finder ──────────────────────────────
+      // Instead of always picking result[0], find the result whose
+      // title most closely matches our song title
+      const scoredMatch = (results, targetTitle, targetArtist) => {
+        if (!results?.length) return null;
+        const t = targetTitle.toLowerCase();
+        const a = targetArtist.toLowerCase();
+
+        const scored = results.map(r => {
+          let score = 0;
+          const rt = (r.trackName || '').toLowerCase();
+          const ra = (r.artistName || '').toLowerCase();
+          // Exact title match — highest score
+          if (rt === t) score += 100;
+          // Title contains our title
+          else if (rt.includes(t) || t.includes(rt)) score += 50;
+          // Artist match
+          if (ra === a) score += 40;
+          else if (ra.includes(a) || a.includes(ra)) score += 20;
+          // Prefer synced lyrics
+          if (r.syncedLyrics) score += 10;
+          return { result: r, score };
+        });
+
+        scored.sort((a, b) => b.score - a.score);
+        return scored[0].score > 0 ? scored[0].result : results[0];
+      };
+
+      // ── Extract lyrics from best match ─────────────────────────────
+      const processResult = (match) => {
+        if (!match) return false;
+        if (match.syncedLyrics) {
+          const lines = parseSyncedLyrics(match.syncedLyrics);
+          if (lines.length > 0) { setSyncedLines(lines); return true; }
+        }
+        if (match.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+        return false;
+      };
+
+      // Try 1: aggressive title + artist — pick best match
+      let res = await axios.get('https://lrclib.net/api/search', {
+        params: { q: `${aggressiveTitle} ${cleanArtist}` }
+      });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+
+      // Try 2: aggressive title only
+      res = await axios.get('https://lrclib.net/api/search', {
+        params: { q: aggressiveTitle }
+      });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+
+      // Try 3: clean title + artist
+      res = await axios.get('https://lrclib.net/api/search', {
+        params: { q: `${cleanTitle} ${cleanArtist}` }
+      });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+
+      // Try 4: clean title only
+      res = await axios.get('https://lrclib.net/api/search', {
+        params: { q: cleanTitle }
+      });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+
+      // Try 5: LRCLIB /get with structured params
+      res = await axios.get('https://lrclib.net/api/get', {
+        params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+      });
+      if (res.data && processResult(res.data)) return;
+
+      // Try 6: original title as last resort
+      res = await axios.get('https://lrclib.net/api/search', {
+        params: { q: song.title }
+      });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, song.title, cleanArtist))) return;
+
+      setPlainLyrics('Lyrics not found for this song.');
+    } catch {
+      setPlainLyrics('Could not load lyrics. Please try again.');
+    } finally {
+      setLyricsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+  // ── Progress ────────────────────────────────────────────────────────────
+  const startProgressTracking = () => {
+    stopProgressTracking();
+    progressInterval.current = setInterval(() => {
+      if (playerRef.current?.getCurrentTime) {
+        const cur   = playerRef.current.getCurrentTime();
+        const total = playerRef.current.getDuration();
+        if (total > 0) setProgress((cur / total) * 100);
+        // Update synced lyrics line index
+        setSyncedLines(prev => {
+          if (prev.length === 0) return prev;
+          // Find last line whose time <= current time
+          let idx = 0;
+          for (let i = 0; i < prev.length; i++) {
+            if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i; // adjustable lookahead
+            else break;
+          }
+          setCurrentLineIndex(idx);
+          return prev;
+        });
+      }
+    }, 300); // 300ms for smoother lyrics sync
+  };
+  const stopProgressTracking = () => {
+    if (progressInterval.current) {
+      clearInterval(progressInterval.current);
+      progressInterval.current = null;
+    }
+  };
+  useEffect(() => () => stopProgressTracking(), []);
+
+  // Track fullscreen state changes (e.g. user presses Escape key)
+  useEffect(() => {
+    const onChange = () => {
+      const full = !!(document.fullscreenElement
+        || document.webkitFullscreenElement
+        || document.mozFullScreenElement
+        || document.msFullscreenElement);
+      setIsFullscreen(full);
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
+  }, []);
+
+  // ── Load YouTube IFrame API once ────────────────────────────────────────
+  useEffect(() => {
+    if (window.YT) return;
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.body.appendChild(tag);
+  }, []);
+
+  // ── Create / reload player when song changes ────────────────────────────
+  useEffect(() => {
+    if (!currentSong) return;
+
+    const initPlayer = () => {
+      // Destroy old player cleanly
+      if (playerRef.current) {
+        try { playerRef.current.destroy(); } catch {}
+        playerRef.current = null;
+        isReady.current = false;
+      }
+
+      playerRef.current = new window.YT.Player(playerContRef.current, {
+        videoId: currentSong.youtube_id,
+        playerVars: {
+          autoplay: 1,
+          controls: 0,       // we provide our own controls
+          disablekb: 1,
+          fs: 0,
+          iv_load_policy: 3,
+          modestbranding: 1,
+          rel: 0,
+          playsinline: 1,
+          origin: window.location.origin,
+          vq: 'hd720'        // default quality 720p
+        },
+        events: {
+          onReady: (e) => {
+            isReady.current = true;
+            e.target.unMute();
+            e.target.setVolume(volume);
+            e.target.setPlaybackQuality('hd720'); // force 720p
+            e.target.playVideo();
+          },
+          onStateChange: (e) => {
+            if (e.data === window.YT.PlayerState.PLAYING) {
+              setIsPlaying(true);
+              startProgressTracking();
+              // Ensure quality stays at 720p
+              try { e.target.setPlaybackQuality('hd720'); } catch {}
+              // ✅ Tell OS this is a music player — keeps audio alive on lock screen
+              if ('mediaSession' in navigator) {
+                navigator.mediaSession.metadata = new window.MediaMetadata({
+                  title:  currentSong.title,
+                  artist: currentSong.artist,
+                  artwork: [
+                    { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+                  ]
+                });
+                navigator.mediaSession.playbackState = 'playing';
+                // Lock screen controls
+                navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+                navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+                navigator.mediaSession.setActionHandler('nexttrack',      () => playNextRef.current?.());
+                navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
+                navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+              }
+            } else if (e.data === window.YT.PlayerState.PAUSED) {
+              setIsPlaying(false);
+              stopProgressTracking();
+              if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'paused';
+              }
+            } else if (e.data === window.YT.PlayerState.ENDED) {
+              stopProgressTracking();
+              setProgress(0);
+              // ✅ Destroy the player immediately — this removes the iframe from DOM
+              // before YouTube can render its suggestion screen. No iframe = no suggestions.
+              try {
+                playerRef.current.destroy();
+                playerRef.current = null;
+                isReady.current = false;
+              } catch {}
+              playNextRef.current?.();
+            }
+          },
+          onError: (e) => {
+            if (e.data === 101 || e.data === 150) playNextRef.current?.();
+            else setIsPlaying(false);
+          }
+        }
+      });
+    };
+
+    if (window.YT?.Player) initPlayer();
+    else window.onYouTubeIframeAPIReady = initPlayer;
+  }, [songKey]); // eslint-disable-line
+
+  // ── Play / pause ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!playerRef.current || !isReady.current) return;
+    if (isPlaying) {
+      playerRef.current.unMute();
+      playerRef.current.setVolume(volume);
+      playerRef.current.playVideo();
+    } else {
+      playerRef.current.pauseVideo();
+    }
+  }, [isPlaying]); // eslint-disable-line
+
+  // ── Controls ────────────────────────────────────────────────────────────
+  const handleSeek = (e) => {
+    if (!playerRef.current || !isReady.current) return;
+    const clickX = e.nativeEvent.offsetX;
+    const width  = e.currentTarget.offsetWidth;
+    const total  = playerRef.current.getDuration();
+    if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+  };
+
+  const handleVolumeChange = (e) => {
+    const val = parseInt(e.target.value);
+    setVolume(val);
+    if (playerRef.current && isReady.current) {
+      playerRef.current.setVolume(val);
+      if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+      else           { playerRef.current.unMute(); setIsMuted(false); }
+    }
+  };
+
+  const toggleMute = () => {
+    if (!playerRef.current || !isReady.current) return;
+    if (isMuted) {
+      playerRef.current.unMute();
+      playerRef.current.setVolume(volume || 100);
+      setIsMuted(false);
+    } else {
+      playerRef.current.mute();
+      setIsMuted(true);
+    }
+  };
+
+  const handleFullscreen = () => {
+    const el = videoWrapperRef.current;
+    if (!el) return;
+    // If already fullscreen — exit
+    const isFullscreen = document.fullscreenElement
+      || document.webkitFullscreenElement
+      || document.mozFullScreenElement
+      || document.msFullscreenElement;
+    if (isFullscreen) {
+      if (document.exitFullscreen) document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+      else if (document.msExitFullscreen) document.msExitFullscreen();
+    } else {
+      // Enter fullscreen
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+      else if (el.msRequestFullscreen) el.msRequestFullscreen();
+    }
+  };
+
+  // ── Lyrics renderer ─────────────────────────────────────────────────────
+  const renderLyrics = () => {
+    if (lyricsLoading) return (
+      <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+        <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+        <div>Loading lyrics...</div>
+      </div>
+    );
+
+    // ── Synced lyrics — show 4 lines centered on current line ──
+    if (syncedLines.length > 0) {
+      // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+      // so current line is always 2nd from top, 1 line ahead visible
+      const startIdx = Math.max(0, currentLineIndex - 1);
+      const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+      return (
+        <div style={{
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          height: '100%', gap: '18px', padding: '20px'
+        }}>
+          {visibleLines.map((line, i) => {
+            const globalIndex = startIdx + i;
+            const isCurrent = globalIndex === currentLineIndex;
+            const isNext = globalIndex === currentLineIndex + 1;
+            const isPast = globalIndex < currentLineIndex;
+            return (
+              <div key={globalIndex} style={{
+                textAlign: 'center',
+                fontSize: isCurrent ? '1.5rem' : '1.1rem',
+                fontWeight: isCurrent ? 'bold' : 'normal',
+                color: isCurrent ? '#1db954'
+                     : isNext    ? '#ffffff'
+                     : isPast    ? '#555'
+                     : '#888',
+                transition: 'all 0.3s ease',
+                lineHeight: '1.5',
+                opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+                transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+              }}>
+                {line.text || ' '}
+              </div>
+            );
+          })}
+          {/* Progress indicator */}
+          <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+            {currentLineIndex + 1} / {syncedLines.length}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Plain lyrics — clean scrollable format ──
+    return (
+      <div style={{ padding: '10px 20px', textAlign: 'center' }}>
+        {plainLyrics.split('\n').map((line, i) => (
+          <p key={i} style={{
+            margin: '0',
+            color: line.trim() ? '#ddd' : 'transparent',
+            fontSize: 'clamp(0.88rem, 2.5vw, 1rem)',
+            lineHeight: '2',
+            minHeight: '2rem',
+            fontWeight: line.trim() ? '400' : 'normal'
+          }}>
+            {line.trim() || '\u00a0'}
+          </p>
+        ))}
+      </div>
+    );
+  };
+
+  if (!currentSong) return null;
+
+  return (
+    <>
+      {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+      <div style={{
+        position: 'fixed', inset: 0, zIndex: 2000,
+        background: 'rgba(0,0,0,0.96)',
+        display: 'flex', flexDirection: 'column',
+        // ✅ KEY: use visibility+pointerEvents instead of conditional render
+        // so the iframe is NEVER removed from DOM — avoids postMessage errors
+        visibility: showModal ? 'visible' : 'hidden',
+        pointerEvents: showModal ? 'all' : 'none'
+      }}>
+        {/* Header */}
+        <div style={{
+          display: 'flex', alignItems: 'center',
+          padding: '10px 14px', borderBottom: '1px solid #333',
+          gap: '10px', flexWrap: 'nowrap', minWidth: 0
+        }}>
+          {/* Song info — truncated to not overflow */}
+          <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+            <div style={{
+              fontWeight: 'bold',
+              fontSize: 'clamp(0.82rem, 2.5vw, 1rem)',
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+            }}>{currentSong.title}</div>
+            <div style={{
+              color: '#b3b3b3',
+              fontSize: 'clamp(0.72rem, 2vw, 0.85rem)',
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+            }}>{currentSong.artist}</div>
+          </div>
+
+          {/* Tab buttons — icon only on small screens */}
+          <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+            {['video', 'lyrics'].map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)} style={{
+                padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+                background: activeTab === tab ? '#1db954' : '#333',
+                color: 'white', display: 'flex', alignItems: 'center', gap: '5px',
+                fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap'
+              }}>
+                {tab === 'video' ? <Tv size={13} /> : <Music size={13} />}
+                <span style={{ display: 'var(--tab-label-display, inline)' }}>
+                  {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                </span>
+              </button>
+            ))}
+          </div>
+
+          {/* Close button */}
+          <button onClick={() => setShowModal(false)} style={{
+            background: '#333', border: 'none', borderRadius: '50%',
+            width: '32px', height: '32px', flexShrink: 0,
+            cursor: 'pointer', display: 'flex',
+            alignItems: 'center', justifyContent: 'center', color: 'white'
+          }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Content area */}
+        <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+          {/* VIDEO TAB */}
+          <div style={{
+            display: activeTab === 'video' ? 'flex' : 'none',
+            flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+          }}>
+            <div ref={videoWrapperRef} style={{
+              width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+              borderRadius: '12px', overflow: 'hidden',
+              position: 'relative', background: '#000'
+            }}>
+              {/* ✅ Player always lives here — never unmounted */}
+              <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+              {/* ✅ Transparent click-blocker — sits over entire video at all times.
+                  Uses onMouseDown to pass seek/play through, blocks everything else.
+                  This is the only reliable way to block iframe clicks from parent page. */}
+              <div
+                style={{
+                  position: 'absolute', inset: 0,
+                  zIndex: 20,
+                  background: 'transparent',
+                  cursor: 'default'
+                }}
+                onMouseDown={(e) => {
+                  // Allow clicks only on our custom controls (they have higher z-index)
+                  // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+                  e.stopPropagation();
+                }}
+              />
+
+              {/* Top overlay — covers YouTube title, channel name, menu dots */}
+              <div style={{
+                position: 'absolute', top: 0, left: 0, right: 0,
+                height: '60px',
+                background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+                zIndex: 30,
+                pointerEvents: 'none'
+              }} />
+
+
+              {/* Custom controls overlay */}
+              <div style={{
+                position: 'absolute', bottom: 0, left: 0, right: 0,
+                padding: '50px 16px 12px',
+                background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+                zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+              }}>
+                {/* Seekbar */}
+                <div onClick={handleSeek} style={{
+                  width: '100%', height: '4px',
+                  background: 'rgba(255,255,255,0.3)',
+                  borderRadius: '2px', cursor: 'pointer'
+                }}>
+                  <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+                </div>
+                {/* Buttons */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                    <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+                      style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+                      onClick={() => hasPrev && playPrev()} />
+                    <button onClick={togglePlay} style={{
+                      background: 'white', border: 'none', borderRadius: '50%',
+                      width: '36px', height: '36px',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+                    }}>
+                      {isPlaying
+                        ? <Pause size={18} color="black" />
+                        : <Play  size={18} color="black" fill="black" />}
+                    </button>
+                    <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+                      style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+                      onClick={() => hasNext && playNext()} />
+                    <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+                      {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+                    </div>
+                    <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+                      onChange={handleVolumeChange}
+                      style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+                  </div>
+                  <button onClick={handleFullscreen} style={{
+                    background: 'transparent', border: 'none',
+                    cursor: 'pointer', color: 'white',
+                    display: 'flex', alignItems: 'center', gap: '4px'
+                  }}>
+                    {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* LYRICS TAB */}
+          {activeTab === 'lyrics' && (
+            <div style={{
+              flex: 1, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center',
+              padding: '20px', overflow: 'hidden'
+            }}>
+              {/* Song info header */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px', width: '100%', maxWidth: '600px' }}>
+                <img src={currentSong.image_url} alt={currentSong.title}
+                  style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 'bold', fontSize: 'clamp(0.85rem, 2.5vw, 1rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
+                  <div style={{ color: '#b3b3b3', fontSize: '0.82rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
+                </div>
+                {/* Hinglish toggle — show only when Devanagari detected */}
+                {(syncedLines.some(l => hasDevanagari(l.text)) || hasDevanagari(plainLyrics)) && (
+                  <button
+                    onClick={async () => {
+                      if (translitMode === 'original') {
+                        setTranslitMode('loading');
+                        const lyricsText = syncedLines.length > 0
+                          ? syncedLines.map(l => l.text).join('\n')
+                          : plainLyrics;
+                        const result = await transliterateToHinglish(lyricsText);
+                        const lines = result.split('\n');
+                        if (syncedLines.length > 0) {
+                          setSyncedLines(prev => prev.map((l, i) => ({ ...l, text: lines[i] || l.text })));
+                        } else {
+                          setPlainLyrics(result);
+                        }
+                        setTranslitMode('hinglish');
+                      } else if (translitMode === 'hinglish') {
+                        // Reload original lyrics
+                        fetchLyrics(currentSong);
+                        setTranslitMode('original');
+                      }
+                    }}
+                    disabled={translitMode === 'loading'}
+                    style={{
+                      flexShrink: 0,
+                      padding: '6px 12px', borderRadius: '20px', border: 'none',
+                      cursor: translitMode === 'loading' ? 'wait' : 'pointer',
+                      background: translitMode === 'hinglish' ? '#1db954' : '#333',
+                      color: 'white', fontSize: '0.75rem', fontWeight: 600,
+                      whiteSpace: 'nowrap'
+                    }}
+                  >
+                    {translitMode === 'loading' ? '...' : translitMode === 'hinglish' ? 'अ Original' : 'A Hinglish'}
+                  </button>
+                )}
+              </div>
+
+              {/* Sync offset controls — only show when synced lyrics available */}
+              {syncedLines.length > 0 && (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: '10px',
+                  marginBottom: '20px', background: '#1e1e1e',
+                  borderRadius: '20px', padding: '6px 14px'
+                }}>
+                  <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+                  <button
+                    onClick={() => setLyricsOffset(prev => {
+                      const v = Math.round((prev - 0.5) * 10) / 10;
+                      lyricsOffsetRef.current = v; return v;
+                    })}
+                    style={{
+                      background: '#333', border: 'none', borderRadius: '50%',
+                      width: '26px', height: '26px', cursor: 'pointer',
+                      color: 'white', fontSize: '16px', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center'
+                    }}
+                  >−</button>
+                  <span style={{
+                    color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+                    fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+                  }}>
+                    {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+                  </span>
+                  <button
+                    onClick={() => setLyricsOffset(prev => {
+                      const v = Math.round((prev + 0.5) * 10) / 10;
+                      lyricsOffsetRef.current = v; return v;
+                    })}
+                    style={{
+                      background: '#333', border: 'none', borderRadius: '50%',
+                      width: '26px', height: '26px', cursor: 'pointer',
+                      color: 'white', fontSize: '16px', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center'
+                    }}
+                  >+</button>
+                  {/* Reset to default */}
+                  {lyricsOffset !== 1.5 && (
+                    <button
+                      onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+                      style={{
+                        background: 'transparent', border: 'none',
+                        color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+                      }}
+                    >Reset</button>
+                  )}
+                </div>
+              )}
+              {/* Synced lyrics display */}
+              <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {renderLyrics()}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Lyrics tab footer controls */}
+        {activeTab === 'lyrics' && (
+          <div style={{
+            padding: '12px 24px 20px', borderTop: '1px solid #333',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+              <Shuffle size={18} onClick={toggleShuffle}
+                style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+              <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+                style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+                onClick={() => hasPrev && playPrev()} />
+              <button onClick={togglePlay} style={{
+                background: 'white', border: 'none', borderRadius: '50%',
+                width: '48px', height: '48px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+              }}>
+                {isPlaying
+                  ? <Pause size={26} color="black" />
+                  : <Play  size={26} color="black" fill="black" />}
+              </button>
+              <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+                style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+                onClick={() => hasNext && playNext()} />
+              <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+                {repeat === 'one'
+                  ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+                  : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+                {repeat !== 'none' && (
+                  <div style={{
+                    position: 'absolute', bottom: '-4px', left: '50%',
+                    transform: 'translateX(-50%)',
+                    width: '4px', height: '4px',
+                    borderRadius: '50%', background: '#1db954'
+                  }} />
+                )}
+              </div>
+            </div>
+            <div onClick={handleSeek} style={{
+              width: '60%', height: '4px', background: '#444',
+              borderRadius: '2px', cursor: 'pointer'
+            }}>
+              <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+      <div className="player-bar">
+
+        {/* Song info — click to open modal */}
+        <div className="player-info" style={{ cursor: 'pointer' }}
+          onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+          <div style={{ position: 'relative' }}>
+            <img src={currentSong.image_url} alt={currentSong.title} />
+            <div style={{
+              position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+            }}
+              onMouseEnter={e => e.currentTarget.style.opacity = 1}
+              onMouseLeave={e => e.currentTarget.style.opacity = 0}
+            >
+              <Tv size={20} color="white" />
+            </div>
+          </div>
+          <div>
+            <div className="song-title">{currentSong.title}</div>
+            <div className="song-artist">{currentSong.artist}</div>
+            {queue.length > 0 && currentIndex >= 0 && (
+              <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+                {currentIndex + 1} / {queue.length} in playlist
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div className="player-controls">
+          <div className="control-buttons">
+            {/* Shuffle — smaller on mobile via CSS var */}
+            <Shuffle
+              size={15}
+              onClick={toggleShuffle}
+              style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3', flexShrink: 0 }}
+            />
+            <SkipBack size={16} fill={hasPrev ? 'white' : '#555'}
+              style={{ cursor: hasPrev ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+              onClick={() => hasPrev && playPrev()} />
+            <button onClick={togglePlay} style={{
+              background: 'white', border: 'none', borderRadius: '50%',
+              width: '34px', height: '34px', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+            }}>
+              {isPlaying
+                ? <Pause size={18} color="black" />
+                : <Play  size={18} color="black" fill="black" />}
+            </button>
+            <SkipForward size={16} fill={hasNext ? 'white' : '#555'}
+              style={{ cursor: hasNext ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+              onClick={() => hasNext && playNext()} />
+            {/* Repeat */}
+            <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+              {repeat === 'one'
+                ? <Repeat1 size={15} style={{ color: '#1db954' }} />
+                : <Repeat  size={15} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+              }
+              {/* Small dot indicator when repeat is active */}
+              {repeat !== 'none' && (
+                <div style={{
+                  position: 'absolute', bottom: '-4px', left: '50%',
+                  transform: 'translateX(-50%)',
+                  width: '4px', height: '4px',
+                  borderRadius: '50%', background: '#1db954'
+                }} />
+              )}
+            </div>
+          </div>
+          <div onClick={handleSeek} style={{
+            width: '100%', height: '4px', background: '#444',
+            borderRadius: '2px', cursor: 'pointer', position: 'relative'
+          }}>
+            <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+          </div>
+        </div>
+
+        {/* Volume — hidden on mobile via CSS */}
+        <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+          <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+            {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+          </div>
+          <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+            onChange={handleVolumeChange}
+            style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+        </div>
+      </div>
+    </>
+  );
+};
+
+export default PlayerBar;
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+//   // Keep ref always pointing to latest playNext so stale closures in YT callbacks use current repeat state
+//   useEffect(() => { playNextRef.current = playNext; }, [playNext]);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const [lyricsOffset, setLyricsOffset]         = useState(1.5); // seconds ahead of song
+//   const progressInterval = useRef(null);
+//   const lyricsOffsetRef  = useRef(1.5);
+//   const playNextRef      = useRef(null); // always holds latest playNext to avoid stale closure // mirror of lyricsOffset for use inside setInterval
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5;
+//     try {
+//       // ── Clean title aggressively ───────────────────────────────────
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '')
+//         .replace(/\|.*/g, '').replace(/ft\.?.*/gi, '')
+//         .replace(/feat\.?.*/gi, '').trim();
+
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '').replace(/official.*/gi, '')
+//         .replace(/lyrics.*/gi, '').replace(/video.*/gi, '')
+//         .replace(/hd.*/gi, '').replace(/full\s+song.*/gi, '').trim();
+
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '')
+//         .replace(/official$/i, '').replace(/music$/i, '').trim();
+
+//       // ── Score-based best match finder ──────────────────────────────
+//       // Instead of always picking result[0], find the result whose
+//       // title most closely matches our song title
+//       const scoredMatch = (results, targetTitle, targetArtist) => {
+//         if (!results?.length) return null;
+//         const t = targetTitle.toLowerCase();
+//         const a = targetArtist.toLowerCase();
+
+//         const scored = results.map(r => {
+//           let score = 0;
+//           const rt = (r.trackName || '').toLowerCase();
+//           const ra = (r.artistName || '').toLowerCase();
+//           // Exact title match — highest score
+//           if (rt === t) score += 100;
+//           // Title contains our title
+//           else if (rt.includes(t) || t.includes(rt)) score += 50;
+//           // Artist match
+//           if (ra === a) score += 40;
+//           else if (ra.includes(a) || a.includes(ra)) score += 20;
+//           // Prefer synced lyrics
+//           if (r.syncedLyrics) score += 10;
+//           return { result: r, score };
+//         });
+
+//         scored.sort((a, b) => b.score - a.score);
+//         return scored[0].score > 0 ? scored[0].result : results[0];
+//       };
+
+//       // ── Extract lyrics from best match ─────────────────────────────
+//       const processResult = (match) => {
+//         if (!match) return false;
+//         if (match.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Try 1: aggressive title + artist — pick best match
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+
+//       // Try 3: clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+
+//       // Try 4: clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+
+//       // Try 5: LRCLIB /get with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, song.title, cleanArtist))) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i; // adjustable lookahead
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//               // ✅ Tell OS this is a music player — keeps audio alive on lock screen
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.metadata = new window.MediaMetadata({
+//                   title:  currentSong.title,
+//                   artist: currentSong.artist,
+//                   artwork: [
+//                     { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+//                   ]
+//                 });
+//                 navigator.mediaSession.playbackState = 'playing';
+//                 // Lock screen controls
+//                 navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                 navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                 navigator.mediaSession.setActionHandler('nexttrack',      () => playNextRef.current?.());
+//                 navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
+//                 navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.playbackState = 'paused';
+//               }
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNextRef.current?.();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNextRef.current?.();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center',
+//           padding: '10px 14px', borderBottom: '1px solid #333',
+//           gap: '10px', flexWrap: 'nowrap', minWidth: 0
+//         }}>
+//           {/* Song info — truncated to not overflow */}
+//           <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+//             <div style={{
+//               fontWeight: 'bold',
+//               fontSize: 'clamp(0.82rem, 2.5vw, 1rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.title}</div>
+//             <div style={{
+//               color: '#b3b3b3',
+//               fontSize: 'clamp(0.72rem, 2vw, 0.85rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.artist}</div>
+//           </div>
+
+//           {/* Tab buttons — icon only on small screens */}
+//           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '5px',
+//                 fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap'
+//               }}>
+//                 {tab === 'video' ? <Tv size={13} /> : <Music size={13} />}
+//                 <span style={{ display: 'var(--tab-label-display, inline)' }}>
+//                   {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//                 </span>
+//               </button>
+//             ))}
+//           </div>
+
+//           {/* Close button */}
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '32px', height: '32px', flexShrink: 0,
+//             cursor: 'pointer', display: 'flex',
+//             alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={16} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+
+//               {/* Sync offset controls — only show when synced lyrics available */}
+//               {syncedLines.length > 0 && (
+//                 <div style={{
+//                   display: 'flex', alignItems: 'center', gap: '10px',
+//                   marginBottom: '20px', background: '#1e1e1e',
+//                   borderRadius: '20px', padding: '6px 14px'
+//                 }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev - 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >−</button>
+//                   <span style={{
+//                     color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+//                     fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+//                   }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev + 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >+</button>
+//                   {/* Reset to default */}
+//                   {lyricsOffset !== 1.5 && (
+//                     <button
+//                       onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+//                       style={{
+//                         background: 'transparent', border: 'none',
+//                         color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+//                       }}
+//                     >Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <Shuffle size={18} onClick={toggleShuffle}
+//                 style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//               <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//                 {repeat === 'one'
+//                   ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                   : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//                 {repeat !== 'none' && (
+//                   <div style={{
+//                     position: 'absolute', bottom: '-4px', left: '50%',
+//                     transform: 'translateX(-50%)',
+//                     width: '4px', height: '4px',
+//                     borderRadius: '50%', background: '#1db954'
+//                   }} />
+//                 )}
+//               </div>
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             {/* Shuffle — smaller on mobile via CSS var */}
+//             <Shuffle
+//               size={15}
+//               onClick={toggleShuffle}
+//               style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3', flexShrink: 0 }}
+//             />
+//             <SkipBack size={16} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '34px', height: '34px', flexShrink: 0,
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={18} color="black" />
+//                 : <Play  size={18} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={16} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+//               onClick={() => hasNext && playNext()} />
+//             {/* Repeat */}
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+//               {repeat === 'one'
+//                 ? <Repeat1 size={15} style={{ color: '#1db954' }} />
+//                 : <Repeat  size={15} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+//               }
+//               {/* Small dot indicator when repeat is active */}
+//               {repeat !== 'none' && (
+//                 <div style={{
+//                   position: 'absolute', bottom: '-4px', left: '50%',
+//                   transform: 'translateX(-50%)',
+//                   width: '4px', height: '4px',
+//                   borderRadius: '50%', background: '#1db954'
+//                 }} />
+//               )}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume — hidden on mobile via CSS */}
+//         <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+//lyrics and refreesh
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+//   // Keep ref always pointing to latest playNext so stale closures in YT callbacks use current repeat state
+//   useEffect(() => { playNextRef.current = playNext; }, [playNext]);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const [lyricsOffset, setLyricsOffset]         = useState(1.5); // seconds ahead of song
+//   const progressInterval = useRef(null);
+//   const lyricsOffsetRef  = useRef(1.5);
+//   const playNextRef      = useRef(null); // always holds latest playNext to avoid stale closure // mirror of lyricsOffset for use inside setInterval
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; // reset offset for each new song
+//     try {
+//       // Helper — prefer synced, fall back to plain
+//       const processResult = (match) => {
+//         if (match?.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match?.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i; // adjustable lookahead
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//               // ✅ Tell OS this is a music player — keeps audio alive on lock screen
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.metadata = new window.MediaMetadata({
+//                   title:  currentSong.title,
+//                   artist: currentSong.artist,
+//                   artwork: [
+//                     { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+//                   ]
+//                 });
+//                 navigator.mediaSession.playbackState = 'playing';
+//                 // Lock screen controls
+//                 navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                 navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                 navigator.mediaSession.setActionHandler('nexttrack',      () => playNextRef.current?.());
+//                 navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
+//                 navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.playbackState = 'paused';
+//               }
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNextRef.current?.();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNextRef.current?.();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center',
+//           padding: '10px 14px', borderBottom: '1px solid #333',
+//           gap: '10px', flexWrap: 'nowrap', minWidth: 0
+//         }}>
+//           {/* Song info — truncated to not overflow */}
+//           <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+//             <div style={{
+//               fontWeight: 'bold',
+//               fontSize: 'clamp(0.82rem, 2.5vw, 1rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.title}</div>
+//             <div style={{
+//               color: '#b3b3b3',
+//               fontSize: 'clamp(0.72rem, 2vw, 0.85rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.artist}</div>
+//           </div>
+
+//           {/* Tab buttons — icon only on small screens */}
+//           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '5px',
+//                 fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap'
+//               }}>
+//                 {tab === 'video' ? <Tv size={13} /> : <Music size={13} />}
+//                 <span style={{ display: 'var(--tab-label-display, inline)' }}>
+//                   {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//                 </span>
+//               </button>
+//             ))}
+//           </div>
+
+//           {/* Close button */}
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '32px', height: '32px', flexShrink: 0,
+//             cursor: 'pointer', display: 'flex',
+//             alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={16} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+
+//               {/* Sync offset controls — only show when synced lyrics available */}
+//               {syncedLines.length > 0 && (
+//                 <div style={{
+//                   display: 'flex', alignItems: 'center', gap: '10px',
+//                   marginBottom: '20px', background: '#1e1e1e',
+//                   borderRadius: '20px', padding: '6px 14px'
+//                 }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev - 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >−</button>
+//                   <span style={{
+//                     color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+//                     fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+//                   }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev + 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >+</button>
+//                   {/* Reset to default */}
+//                   {lyricsOffset !== 1.5 && (
+//                     <button
+//                       onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+//                       style={{
+//                         background: 'transparent', border: 'none',
+//                         color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+//                       }}
+//                     >Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <Shuffle size={18} onClick={toggleShuffle}
+//                 style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//               <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//                 {repeat === 'one'
+//                   ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                   : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//                 {repeat !== 'none' && (
+//                   <div style={{
+//                     position: 'absolute', bottom: '-4px', left: '50%',
+//                     transform: 'translateX(-50%)',
+//                     width: '4px', height: '4px',
+//                     borderRadius: '50%', background: '#1db954'
+//                   }} />
+//                 )}
+//               </div>
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             {/* Shuffle — smaller on mobile via CSS var */}
+//             <Shuffle
+//               size={15}
+//               onClick={toggleShuffle}
+//               style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3', flexShrink: 0 }}
+//             />
+//             <SkipBack size={16} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '34px', height: '34px', flexShrink: 0,
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={18} color="black" />
+//                 : <Play  size={18} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={16} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+//               onClick={() => hasNext && playNext()} />
+//             {/* Repeat */}
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+//               {repeat === 'one'
+//                 ? <Repeat1 size={15} style={{ color: '#1db954' }} />
+//                 : <Repeat  size={15} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+//               }
+//               {/* Small dot indicator when repeat is active */}
+//               {repeat !== 'none' && (
+//                 <div style={{
+//                   position: 'absolute', bottom: '-4px', left: '50%',
+//                   transform: 'translateX(-50%)',
+//                   width: '4px', height: '4px',
+//                   borderRadius: '50%', background: '#1db954'
+//                 }} />
+//               )}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume — hidden on mobile via CSS */}
+//         <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+//suffle and re[peat not shown in phone]
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+//   // Keep ref always pointing to latest playNext so stale closures in YT callbacks use current repeat state
+//   useEffect(() => { playNextRef.current = playNext; }, [playNext]);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const [lyricsOffset, setLyricsOffset]         = useState(1.5); // seconds ahead of song
+//   const progressInterval = useRef(null);
+//   const lyricsOffsetRef  = useRef(1.5);
+//   const playNextRef      = useRef(null); // always holds latest playNext to avoid stale closure // mirror of lyricsOffset for use inside setInterval
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; // reset offset for each new song
+//     try {
+//       // Helper — prefer synced, fall back to plain
+//       const processResult = (match) => {
+//         if (match?.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match?.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i; // adjustable lookahead
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//               // ✅ Tell OS this is a music player — keeps audio alive on lock screen
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.metadata = new window.MediaMetadata({
+//                   title:  currentSong.title,
+//                   artist: currentSong.artist,
+//                   artwork: [
+//                     { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+//                   ]
+//                 });
+//                 navigator.mediaSession.playbackState = 'playing';
+//                 // Lock screen controls
+//                 navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                 navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                 navigator.mediaSession.setActionHandler('nexttrack',      () => playNextRef.current?.());
+//                 navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
+//                 navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.playbackState = 'paused';
+//               }
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNextRef.current?.();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNextRef.current?.();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center',
+//           padding: '10px 14px', borderBottom: '1px solid #333',
+//           gap: '10px', flexWrap: 'nowrap', minWidth: 0
+//         }}>
+//           {/* Song info — truncated to not overflow */}
+//           <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+//             <div style={{
+//               fontWeight: 'bold',
+//               fontSize: 'clamp(0.82rem, 2.5vw, 1rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.title}</div>
+//             <div style={{
+//               color: '#b3b3b3',
+//               fontSize: 'clamp(0.72rem, 2vw, 0.85rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.artist}</div>
+//           </div>
+
+//           {/* Tab buttons — icon only on small screens */}
+//           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '5px',
+//                 fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap'
+//               }}>
+//                 {tab === 'video' ? <Tv size={13} /> : <Music size={13} />}
+//                 <span style={{ display: 'var(--tab-label-display, inline)' }}>
+//                   {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//                 </span>
+//               </button>
+//             ))}
+//           </div>
+
+//           {/* Close button */}
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '32px', height: '32px', flexShrink: 0,
+//             cursor: 'pointer', display: 'flex',
+//             alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={16} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+
+//               {/* Sync offset controls — only show when synced lyrics available */}
+//               {syncedLines.length > 0 && (
+//                 <div style={{
+//                   display: 'flex', alignItems: 'center', gap: '10px',
+//                   marginBottom: '20px', background: '#1e1e1e',
+//                   borderRadius: '20px', padding: '6px 14px'
+//                 }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev - 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >−</button>
+//                   <span style={{
+//                     color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+//                     fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+//                   }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev + 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >+</button>
+//                   {/* Reset to default */}
+//                   {lyricsOffset !== 1.5 && (
+//                     <button
+//                       onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+//                       style={{
+//                         background: 'transparent', border: 'none',
+//                         color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+//                       }}
+//                     >Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <Shuffle size={18} onClick={toggleShuffle}
+//                 style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//               <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//                 {repeat === 'one'
+//                   ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                   : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//                 {repeat !== 'none' && (
+//                   <div style={{
+//                     position: 'absolute', bottom: '-4px', left: '50%',
+//                     transform: 'translateX(-50%)',
+//                     width: '4px', height: '4px',
+//                     borderRadius: '50%', background: '#1db954'
+//                   }} />
+//                 )}
+//               </div>
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             {/* Shuffle button — hidden on very small screens */}
+//             <Shuffle
+//               size={18}
+//               onClick={toggleShuffle}
+//               className="control-hide-mobile"
+//               style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }}
+//             />
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//             {/* Repeat button — hidden on very small screens */}
+//             <div onClick={cycleRepeat} className="control-hide-mobile" style={{ cursor: 'pointer', position: 'relative' }}>
+//               {repeat === 'one'
+//                 ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                 : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+//               }
+//               {/* Small dot indicator when repeat is active */}
+//               {repeat !== 'none' && (
+//                 <div style={{
+//                   position: 'absolute', bottom: '-4px', left: '50%',
+//                   transform: 'translateX(-50%)',
+//                   width: '4px', height: '4px',
+//                   borderRadius: '50%', background: '#1db954'
+//                 }} />
+//               )}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume — hidden on mobile via CSS */}
+//         <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+// refresh and repeat button
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const [lyricsOffset, setLyricsOffset]         = useState(1.5); // seconds ahead of song
+//   const progressInterval = useRef(null);
+//   const lyricsOffsetRef  = useRef(1.5); // mirror of lyricsOffset for use inside setInterval
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; // reset offset for each new song
+//     try {
+//       // Helper — prefer synced, fall back to plain
+//       const processResult = (match) => {
+//         if (match?.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match?.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i; // adjustable lookahead
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//               // ✅ Tell OS this is a music player — keeps audio alive on lock screen
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.metadata = new window.MediaMetadata({
+//                   title:  currentSong.title,
+//                   artist: currentSong.artist,
+//                   artwork: [
+//                     { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+//                   ]
+//                 });
+//                 navigator.mediaSession.playbackState = 'playing';
+//                 // Lock screen controls
+//                 navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                 navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                 navigator.mediaSession.setActionHandler('nexttrack',      () => playNext());
+//                 navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
+//                 navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.playbackState = 'paused';
+//               }
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center',
+//           padding: '10px 14px', borderBottom: '1px solid #333',
+//           gap: '10px', flexWrap: 'nowrap', minWidth: 0
+//         }}>
+//           {/* Song info — truncated to not overflow */}
+//           <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+//             <div style={{
+//               fontWeight: 'bold',
+//               fontSize: 'clamp(0.82rem, 2.5vw, 1rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.title}</div>
+//             <div style={{
+//               color: '#b3b3b3',
+//               fontSize: 'clamp(0.72rem, 2vw, 0.85rem)',
+//               whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+//             }}>{currentSong.artist}</div>
+//           </div>
+
+//           {/* Tab buttons — icon only on small screens */}
+//           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '5px',
+//                 fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap'
+//               }}>
+//                 {tab === 'video' ? <Tv size={13} /> : <Music size={13} />}
+//                 <span style={{ display: 'var(--tab-label-display, inline)' }}>
+//                   {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//                 </span>
+//               </button>
+//             ))}
+//           </div>
+
+//           {/* Close button */}
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '32px', height: '32px', flexShrink: 0,
+//             cursor: 'pointer', display: 'flex',
+//             alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={16} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+
+//               {/* Sync offset controls — only show when synced lyrics available */}
+//               {syncedLines.length > 0 && (
+//                 <div style={{
+//                   display: 'flex', alignItems: 'center', gap: '10px',
+//                   marginBottom: '20px', background: '#1e1e1e',
+//                   borderRadius: '20px', padding: '6px 14px'
+//                 }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev - 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >−</button>
+//                   <span style={{
+//                     color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+//                     fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+//                   }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev + 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >+</button>
+//                   {/* Reset to default */}
+//                   {lyricsOffset !== 1.5 && (
+//                     <button
+//                       onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+//                       style={{
+//                         background: 'transparent', border: 'none',
+//                         color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+//                       }}
+//                     >Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <Shuffle size={18} onClick={toggleShuffle}
+//                 style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//               <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//                 {repeat === 'one'
+//                   ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                   : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//                 {repeat !== 'none' && (
+//                   <div style={{
+//                     position: 'absolute', bottom: '-4px', left: '50%',
+//                     transform: 'translateX(-50%)',
+//                     width: '4px', height: '4px',
+//                     borderRadius: '50%', background: '#1db954'
+//                   }} />
+//                 )}
+//               </div>
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             {/* Shuffle button — hidden on very small screens */}
+//             <Shuffle
+//               size={18}
+//               onClick={toggleShuffle}
+//               className="control-hide-mobile"
+//               style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }}
+//             />
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//             {/* Repeat button — hidden on very small screens */}
+//             <div onClick={cycleRepeat} className="control-hide-mobile" style={{ cursor: 'pointer', position: 'relative' }}>
+//               {repeat === 'one'
+//                 ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                 : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+//               }
+//               {/* Small dot indicator when repeat is active */}
+//               {repeat !== 'none' && (
+//                 <div style={{
+//                   position: 'absolute', bottom: '-4px', left: '50%',
+//                   transform: 'translateX(-50%)',
+//                   width: '4px', height: '4px',
+//                   borderRadius: '50%', background: '#1db954'
+//                 }} />
+//               )}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume — hidden on mobile via CSS */}
+//         <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+// playerbar ,musiccontext,app.css homepage for show more option and repeat fix and phone size video
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const [lyricsOffset, setLyricsOffset]         = useState(1.5); // seconds ahead of song
+//   const progressInterval = useRef(null);
+//   const lyricsOffsetRef  = useRef(1.5); // mirror of lyricsOffset for use inside setInterval
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; // reset offset for each new song
+//     try {
+//       // Helper — prefer synced, fall back to plain
+//       const processResult = (match) => {
+//         if (match?.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match?.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i; // adjustable lookahead
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//               // ✅ Tell OS this is a music player — keeps audio alive on lock screen
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.metadata = new window.MediaMetadata({
+//                   title:  currentSong.title,
+//                   artist: currentSong.artist,
+//                   artwork: [
+//                     { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+//                   ]
+//                 });
+//                 navigator.mediaSession.playbackState = 'playing';
+//                 // Lock screen controls
+//                 navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                 navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                 navigator.mediaSession.setActionHandler('nexttrack',      () => playNext());
+//                 navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
+//                 navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.playbackState = 'paused';
+//               }
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+
+//               {/* Sync offset controls — only show when synced lyrics available */}
+//               {syncedLines.length > 0 && (
+//                 <div style={{
+//                   display: 'flex', alignItems: 'center', gap: '10px',
+//                   marginBottom: '20px', background: '#1e1e1e',
+//                   borderRadius: '20px', padding: '6px 14px'
+//                 }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev - 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >−</button>
+//                   <span style={{
+//                     color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+//                     fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+//                   }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev + 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >+</button>
+//                   {/* Reset to default */}
+//                   {lyricsOffset !== 1.5 && (
+//                     <button
+//                       onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+//                       style={{
+//                         background: 'transparent', border: 'none',
+//                         color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+//                       }}
+//                     >Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <Shuffle size={18} onClick={toggleShuffle}
+//                 style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//               <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//                 {repeat === 'one'
+//                   ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                   : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//                 {repeat !== 'none' && (
+//                   <div style={{
+//                     position: 'absolute', bottom: '-4px', left: '50%',
+//                     transform: 'translateX(-50%)',
+//                     width: '4px', height: '4px',
+//                     borderRadius: '50%', background: '#1db954'
+//                   }} />
+//                 )}
+//               </div>
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             {/* Shuffle button — hidden on very small screens */}
+//             <Shuffle
+//               size={18}
+//               onClick={toggleShuffle}
+//               className="control-hide-mobile"
+//               style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }}
+//             />
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//             {/* Repeat button — hidden on very small screens */}
+//             <div onClick={cycleRepeat} className="control-hide-mobile" style={{ cursor: 'pointer', position: 'relative' }}>
+//               {repeat === 'one'
+//                 ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                 : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+//               }
+//               {/* Small dot indicator when repeat is active */}
+//               {repeat !== 'none' && (
+//                 <div style={{
+//                   position: 'absolute', bottom: '-4px', left: '50%',
+//                   transform: 'translateX(-50%)',
+//                   width: '4px', height: '4px',
+//                   borderRadius: '50%', background: '#1db954'
+//                 }} />
+//               )}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume — hidden on mobile via CSS */}
+//         <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+///*updated app.css,homepage.librarypage,navbar,login page, signin page ,playebar
+//for responsiveness*/
+
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const [lyricsOffset, setLyricsOffset]         = useState(1.5); // seconds ahead of song
+//   const progressInterval = useRef(null);
+//   const lyricsOffsetRef  = useRef(1.5); // mirror of lyricsOffset for use inside setInterval
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; // reset offset for each new song
+//     try {
+//       // Helper — prefer synced, fall back to plain
+//       const processResult = (match) => {
+//         if (match?.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match?.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i; // adjustable lookahead
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//               // ✅ Tell OS this is a music player — keeps audio alive on lock screen
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.metadata = new window.MediaMetadata({
+//                   title:  currentSong.title,
+//                   artist: currentSong.artist,
+//                   artwork: [
+//                     { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+//                   ]
+//                 });
+//                 navigator.mediaSession.playbackState = 'playing';
+//                 // Lock screen controls
+//                 navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                 navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                 navigator.mediaSession.setActionHandler('nexttrack',      () => playNext());
+//                 navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
+//                 navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//               if ('mediaSession' in navigator) {
+//                 navigator.mediaSession.playbackState = 'paused';
+//               }
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '20px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+
+//               {/* Sync offset controls — only show when synced lyrics available */}
+//               {syncedLines.length > 0 && (
+//                 <div style={{
+//                   display: 'flex', alignItems: 'center', gap: '10px',
+//                   marginBottom: '20px', background: '#1e1e1e',
+//                   borderRadius: '20px', padding: '6px 14px'
+//                 }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev - 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >−</button>
+//                   <span style={{
+//                     color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+//                     fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+//                   }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button
+//                     onClick={() => setLyricsOffset(prev => {
+//                       const v = Math.round((prev + 0.5) * 10) / 10;
+//                       lyricsOffsetRef.current = v; return v;
+//                     })}
+//                     style={{
+//                       background: '#333', border: 'none', borderRadius: '50%',
+//                       width: '26px', height: '26px', cursor: 'pointer',
+//                       color: 'white', fontSize: '16px', display: 'flex',
+//                       alignItems: 'center', justifyContent: 'center'
+//                     }}
+//                   >+</button>
+//                   {/* Reset to default */}
+//                   {lyricsOffset !== 1.5 && (
+//                     <button
+//                       onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+//                       style={{
+//                         background: 'transparent', border: 'none',
+//                         color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+//                       }}
+//                     >Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <Shuffle size={18} onClick={toggleShuffle}
+//                 style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//               <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//                 {repeat === 'one'
+//                   ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                   : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//                 {repeat !== 'none' && (
+//                   <div style={{
+//                     position: 'absolute', bottom: '-4px', left: '50%',
+//                     transform: 'translateX(-50%)',
+//                     width: '4px', height: '4px',
+//                     borderRadius: '50%', background: '#1db954'
+//                   }} />
+//                 )}
+//               </div>
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             {/* Shuffle button */}
+//             <Shuffle
+//               size={18}
+//               onClick={toggleShuffle}
+//               style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }}
+//             />
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//             {/* Repeat button — cycles none → one → all */}
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//               {repeat === 'one'
+//                 ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                 : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+//               }
+//               {/* Small dot indicator when repeat is active */}
+//               {repeat !== 'none' && (
+//                 <div style={{
+//                   position: 'absolute', bottom: '-4px', left: '50%',
+//                   transform: 'translateX(-50%)',
+//                   width: '4px', height: '4px',
+//                   borderRadius: '50%', background: '#1db954'
+//                 }} />
+//               )}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+//updating playerbar,index.html public and 
+// creating new files manifest.js and worker in public for playing song inn background and also for making it pwa
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     try {
+//       // Helper — prefer synced, fall back to plain
+//       const processResult = (match) => {
+//         if (match?.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match?.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + 1.5) idx = i; // 1.5s lookahead so lyrics appear slightly before sung
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '30px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <Shuffle size={18} onClick={toggleShuffle}
+//                 style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//               <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//                 {repeat === 'one'
+//                   ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                   : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//                 {repeat !== 'none' && (
+//                   <div style={{
+//                     position: 'absolute', bottom: '-4px', left: '50%',
+//                     transform: 'translateX(-50%)',
+//                     width: '4px', height: '4px',
+//                     borderRadius: '50%', background: '#1db954'
+//                   }} />
+//                 )}
+//               </div>
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             {/* Shuffle button */}
+//             <Shuffle
+//               size={18}
+//               onClick={toggleShuffle}
+//               style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }}
+//             />
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//             {/* Repeat button — cycles none → one → all */}
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//               {repeat === 'one'
+//                 ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+//                 : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+//               }
+//               {/* Small dot indicator when repeat is active */}
+//               {repeat !== 'none' && (
+//                 <div style={{
+//                   position: 'absolute', bottom: '-4px', left: '50%',
+//                   transform: 'translateX(-50%)',
+//                   width: '4px', height: '4px',
+//                   borderRadius: '50%', background: '#1db954'
+//                 }} />
+//               )}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+// adding repeat and shuffle functionality to music context, and a queue for playlist songs
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [syncedLines, setSyncedLines]     = useState([]); // [{time, text}]
+//   const [plainLyrics, setPlainLyrics]     = useState('');  // fallback plain text
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     try {
+//       // Helper — prefer synced, fall back to plain
+//       const processResult = (match) => {
+//         if (match?.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match?.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && processResult(res.data)) return;
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && processResult(res.data[0])) return;
+
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         // Update synced lyrics line index
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           // Find last line whose time <= current time
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + 1.5) idx = i; // 1.5s lookahead so lyrics appear slightly before sung
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300); // 300ms for smoother lyrics sync
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     // ── Synced lyrics — show 4 lines centered on current line ──
+//     if (syncedLines.length > 0) {
+//       // Show lines from (currentLineIndex - 1) to (currentLineIndex + 2)
+//       // so current line is always 2nd from top, 1 line ahead visible
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+//       return (
+//         <div style={{
+//           display: 'flex', flexDirection: 'column',
+//           alignItems: 'center', justifyContent: 'center',
+//           height: '100%', gap: '18px', padding: '20px'
+//         }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext = globalIndex === currentLineIndex + 1;
+//             const isPast = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954'
+//                      : isNext    ? '#ffffff'
+//                      : isPast    ? '#555'
+//                      : '#888',
+//                 transition: 'all 0.3s ease',
+//                 lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           {/* Progress indicator */}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     // ── Plain lyrics fallback ──
+//     return (
+//       <div style={{ padding: '10px' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{
+//             margin: '2px 0',
+//             color: line.trim() ? '#fff' : 'transparent',
+//             fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//           }}>
+//             {line || '\u200b'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', flexDirection: 'column',
+//               alignItems: 'center', justifyContent: 'center',
+//               padding: '20px', overflow: 'hidden'
+//             }}>
+//               {/* Song info header */}
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '30px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '60px', height: '60px', borderRadius: '8px', objectFit: 'cover' }} />
+//                 <div>
+//                   <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+//               {/* Synced lyrics display */}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+// only 4 line lyrics
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [lyrics, setLyrics]               = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyrics('');
+//     try {
+//       // Helper to extract lyrics text from LRCLIB result
+//       const extractLyrics = (match) =>
+//         match?.plainLyrics ||
+//         match?.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '') ||
+//         '';
+
+//       // Clean YouTube title — only remove bracketed noise, keep dash parts
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')        // remove (Official Video), (Audio) etc
+//         .replace(/\[.*?\]/g, '')        // remove [Official], [Lyrics] etc
+//         .replace(/\|.*/g, '')           // remove everything after |
+//         .replace(/ft\.?.*/gi, '')       // remove ft. features
+//         .replace(/feat\.?.*/gi, '')     // remove feat. features
+//         .trim();
+
+//       // More aggressive clean — also strip after dash (for "Song Name - Movie Name")
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '')      // remove " - anything"
+//         .replace(/official.*/gi, '')    // remove official suffix
+//         .replace(/lyrics.*/gi, '')      // remove lyrics suffix
+//         .replace(/video.*/gi, '')       // remove video suffix
+//         .replace(/hd.*/gi, '')          // remove HD suffix
+//         .replace(/full\s+song.*/gi, '') // remove full song suffix
+//         .trim();
+
+//       // Clean artist name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '') // remove "- Topic" auto-generated channels
+//         .replace(/VEVO$/i, '')          // remove VEVO
+//         .replace(/official$/i, '')      // remove Official
+//         .replace(/music$/i, '')         // remove Music
+//         .trim();
+
+//       // Try 1: aggressive title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${aggressiveTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && extractLyrics(res.data[0]))
+//         return setLyrics(extractLyrics(res.data[0]));
+
+//       // Try 2: aggressive title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: aggressiveTitle }
+//       });
+//       if (res.data?.length > 0 && extractLyrics(res.data[0]))
+//         return setLyrics(extractLyrics(res.data[0]));
+
+//       // Try 3: mild clean title + artist
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && extractLyrics(res.data[0]))
+//         return setLyrics(extractLyrics(res.data[0]));
+
+//       // Try 4: mild clean title only
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && extractLyrics(res.data[0]))
+//         return setLyrics(extractLyrics(res.data[0]));
+
+//       // Try 5: LRCLIB /get endpoint with structured params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && extractLyrics(res.data))
+//         return setLyrics(extractLyrics(res.data));
+
+//       // Try 6: raw original title as last resort
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: song.title }
+//       });
+//       if (res.data?.length > 0 && extractLyrics(res.data[0]))
+//         return setLyrics(extractLyrics(res.data[0]));
+
+//       setLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//       }
+//     }, 500);
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() ? '#fff' : 'transparent',
+//         fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//       }}>
+//         {line || '\u200b'}
+//       </p>
+//     ));
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', gap: '40px',
+//               padding: '30px 60px', overflowY: 'auto'
+//             }}>
+//               <div style={{ flexShrink: 0 }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }} />
+//                 <div style={{ marginTop: '16px', fontWeight: 'bold' }}>{currentSong.title}</div>
+//                 <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//               </div>
+//               <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+//1or2 line ahead lyrics fix not whole lyrics
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [lyrics, setLyrics]               = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyrics('');
+//     try {
+//       // Aggressively clean YouTube title noise
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')           // remove (Official Video), (Audio), etc.
+//         .replace(/\[.*?\]/g, '')           // remove [Official], [Lyrics], etc.
+//         .replace(/ft\.?.*/gi, '')          // remove ft. features
+//         .replace(/feat\.?.*/gi, '')        // remove feat. features
+//         .replace(/official.*/gi, '')       // remove "official..." suffix
+//         .replace(/lyrics.*/gi, '')         // remove "lyrics" suffix
+//         .replace(/video.*/gi, '')          // remove "video" suffix
+//         .replace(/full\s+song.*/gi, '')    // remove "full song" suffix
+//         .replace(/hd.*/gi, '')             // remove HD suffix
+//         .replace(/\|.*/g, '')              // remove everything after |
+//         .replace(/-.*/g, '')               // remove everything after - (usually artist repeat)
+//         .trim();
+
+//       // Clean YouTube artist/channel name
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '')     // remove "- Topic" from auto-generated channels
+//         .replace(/VEVO$/i, '')             // remove VEVO suffix
+//         .replace(/official$/i, '')         // remove "Official" suffix
+//         .replace(/music$/i, '')            // remove "Music" suffix
+//         .trim();
+
+//       // Helper to extract lyrics text from result
+//       const extractLyrics = (match) =>
+//         match.plainLyrics ||
+//         match.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '') ||
+//         '';
+
+//       // Try 1: Search with cleaned title + artist
+//       let res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0 && extractLyrics(res.data[0])) {
+//         return setLyrics(extractLyrics(res.data[0]));
+//       }
+
+//       // Try 2: Search with only cleaned title (artist might be wrong)
+//       res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: cleanTitle }
+//       });
+//       if (res.data?.length > 0 && extractLyrics(res.data[0])) {
+//         return setLyrics(extractLyrics(res.data[0]));
+//       }
+
+//       // Try 3: Use LRCLIB get endpoint with track_name + artist_name params
+//       res = await axios.get('https://lrclib.net/api/get', {
+//         params: { track_name: cleanTitle, artist_name: cleanArtist }
+//       });
+//       if (res.data && extractLyrics(res.data)) {
+//         return setLyrics(extractLyrics(res.data));
+//       }
+
+//       setLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//       }
+//     }, 500);
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() ? '#fff' : 'transparent',
+//         fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//       }}>
+//         {line || '\u200b'}
+//       </p>
+//     ));
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', gap: '40px',
+//               padding: '30px 60px', overflowY: 'auto'
+//             }}>
+//               <div style={{ flexShrink: 0 }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }} />
+//                 <div style={{ marginTop: '16px', fontWeight: 'bold' }}>{currentSong.title}</div>
+//                 <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//               </div>
+//               <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+//now fix lyrics not found problem
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef   = useRef(null); // always-present div in modal
+//   const videoWrapperRef = useRef(null); // video wrapper for fullscreen
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [isFullscreen, setIsFullscreen]     = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [lyrics, setLyrics]               = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyrics('');
+//     try {
+//       const cleanTitle  = song.title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
+//       const cleanArtist = song.artist.replace(/\s*-\s*Topic$/i, '').trim();
+//       const res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0) {
+//         const match = res.data[0];
+//         const text = match.plainLyrics
+//           || match.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '')
+//           || '';
+//         setLyrics(text || 'Lyrics not available for this song.');
+//       } else {
+//         setLyrics('Lyrics not found for this song.');
+//       }
+//     } catch {
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//       }
+//     }, 500);
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Track fullscreen state changes (e.g. user presses Escape key)
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement
+//         || document.webkitFullscreenElement
+//         || document.mozFullScreenElement
+//         || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     // If already fullscreen — exit
+//     const isFullscreen = document.fullscreenElement
+//       || document.webkitFullscreenElement
+//       || document.mozFullScreenElement
+//       || document.msFullscreenElement;
+//     if (isFullscreen) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       // Enter fullscreen
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() ? '#fff' : 'transparent',
+//         fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//       }}>
+//         {line || '\u200b'}
+//       </p>
+//     ));
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div ref={videoWrapperRef} style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', gap: '40px',
+//               padding: '30px 60px', overflowY: 'auto'
+//             }}>
+//               <div style={{ flexShrink: 0 }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }} />
+//                 <div style={{ marginTop: '16px', fontWeight: 'bold' }}>{currentSong.title}</div>
+//                 <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//               </div>
+//               <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+//ful screen mode fix
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef = useRef(null); // always-present div in modal
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [lyrics, setLyrics]               = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyrics('');
+//     try {
+//       const cleanTitle  = song.title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
+//       const cleanArtist = song.artist.replace(/\s*-\s*Topic$/i, '').trim();
+//       const res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0) {
+//         const match = res.data[0];
+//         const text = match.plainLyrics
+//           || match.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '')
+//           || '';
+//         setLyrics(text || 'Lyrics not available for this song.');
+//       } else {
+//         setLyrics('Lyrics not found for this song.');
+//       }
+//     } catch {
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//       }
+//     }, 500);
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               // ✅ Destroy the player immediately — this removes the iframe from DOM
+//               // before YouTube can render its suggestion screen. No iframe = no suggestions.
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const iframe = playerContRef.current?.querySelector('iframe');
+//     if (iframe?.requestFullscreen) iframe.requestFullscreen();
+//     else if (iframe?.webkitRequestFullscreen) iframe.webkitRequestFullscreen();
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() ? '#fff' : 'transparent',
+//         fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//       }}>
+//         {line || '\u200b'}
+//       </p>
+//     ));
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* ✅ Transparent click-blocker — sits over entire video at all times.
+//                   Uses onMouseDown to pass seek/play through, blocks everything else.
+//                   This is the only reliable way to block iframe clicks from parent page. */}
+//               <div
+//                 style={{
+//                   position: 'absolute', inset: 0,
+//                   zIndex: 20,
+//                   background: 'transparent',
+//                   cursor: 'default'
+//                 }}
+//                 onMouseDown={(e) => {
+//                   // Allow clicks only on our custom controls (they have higher z-index)
+//                   // This div sits above iframe but below our controls (zIndex 10 controls vs 20 here)
+//                   e.stopPropagation();
+//                 }}
+//               />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 30,
+//                 pointerEvents: 'none'
+//               }} />
+
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     <Maximize2 size={18} />
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', gap: '40px',
+//               padding: '30px 60px', overflowY: 'auto'
+//             }}>
+//               <div style={{ flexShrink: 0 }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }} />
+//                 <div style={{ marginTop: '16px', fontWeight: 'bold' }}>{currentSong.title}</div>
+//                 <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//               </div>
+//               <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+
+//hidding youtube suggestions at the end
+
+
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef = useRef(null); // always-present div in modal
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [lyrics, setLyrics]               = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyrics('');
+//     try {
+//       const cleanTitle  = song.title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
+//       const cleanArtist = song.artist.replace(/\s*-\s*Topic$/i, '').trim();
+//       const res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0) {
+//         const match = res.data[0];
+//         const text = match.plainLyrics
+//           || match.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '')
+//           || '';
+//         setLyrics(text || 'Lyrics not available for this song.');
+//       } else {
+//         setLyrics('Lyrics not found for this song.');
+//       }
+//     } catch {
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//       }
+//     }, 500);
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const iframe = playerContRef.current?.querySelector('iframe');
+//     if (iframe?.requestFullscreen) iframe.requestFullscreen();
+//     else if (iframe?.webkitRequestFullscreen) iframe.webkitRequestFullscreen();
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() ? '#fff' : 'transparent',
+//         fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//       }}>
+//         {line || '\u200b'}
+//       </p>
+//     ));
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* Top overlay — covers YouTube title, channel name, menu dots */}
+//               <div style={{
+//                 position: 'absolute', top: 0, left: 0, right: 0,
+//                 height: '60px',
+//                 background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+//                 zIndex: 10,
+                
+//               }} />
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 10, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     <Maximize2 size={18} />
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', gap: '40px',
+//               padding: '30px 60px', overflowY: 'auto'
+//             }}>
+//               <div style={{ flexShrink: 0 }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }} />
+//                 <div style={{ marginTop: '16px', fontWeight: 'bold' }}>{currentSong.title}</div>
+//                 <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//               </div>
+//               <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+
+
+// hiding title of youtube
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2 } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+
+//   // ONE player — always mounted in the modal container, just hidden/shown
+//   const playerRef     = useRef(null);
+//   const playerContRef = useRef(null); // always-present div in modal
+//   const isReady       = useRef(false);
+
+//   const [progress, setProgress]           = useState(0);
+//   const [volume, setVolume]               = useState(100);
+//   const [isMuted, setIsMuted]             = useState(false);
+//   const [showModal, setShowModal]         = useState(false);
+//   const [activeTab, setActiveTab]         = useState('video');
+//   const [lyrics, setLyrics]               = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyrics('');
+//     try {
+//       const cleanTitle  = song.title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
+//       const cleanArtist = song.artist.replace(/\s*-\s*Topic$/i, '').trim();
+//       const res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+//       if (res.data?.length > 0) {
+//         const match = res.data[0];
+//         const text = match.plainLyrics
+//           || match.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '')
+//           || '';
+//         setLyrics(text || 'Lyrics not available for this song.');
+//       } else {
+//         setLyrics('Lyrics not found for this song.');
+//       }
+//     } catch {
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Progress ────────────────────────────────────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//       }
+//     }, 500);
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Create / reload player when song changes ────────────────────────────
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       // Destroy old player cleanly
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId: currentSong.youtube_id,
+//         playerVars: {
+//           autoplay: 1,
+//           controls: 0,       // we provide our own controls
+//           disablekb: 1,
+//           fs: 0,
+//           iv_load_policy: 3,
+//           modestbranding: 1,
+//           rel: 0,
+//           playsinline: 1,
+//           origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             e.target.unMute();
+//             e.target.setVolume(volume);
+//             e.target.playVideo();
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               playNext();
+//             }
+//           },
+//           onError: (e) => {
+//             if (e.data === 101 || e.data === 150) playNext();
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]); // eslint-disable-line
+
+//   // ── Play / pause ────────────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]); // eslint-disable-line
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+//     const total  = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const iframe = playerContRef.current?.querySelector('iframe');
+//     if (iframe?.requestFullscreen) iframe.requestFullscreen();
+//     else if (iframe?.webkitRequestFullscreen) iframe.webkitRequestFullscreen();
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() ? '#fff' : 'transparent',
+//         fontSize: '1rem', lineHeight: '1.8', minHeight: '1.8rem'
+//       }}>
+//         {line || '\u200b'}
+//       </p>
+//     ));
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)',
+//         display: 'flex', flexDirection: 'column',
+//         // ✅ KEY: use visibility+pointerEvents instead of conditional render
+//         // so the iframe is NEVER removed from DOM — avoids postMessage errors
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Header */}
+//         <div style={{
+//           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//           padding: '16px 24px', borderBottom: '1px solid #333'
+//         }}>
+//           <div>
+//             <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '8px' }}>
+//             {['video', 'lyrics'].map(tab => (
+//               <button key={tab} onClick={() => setActiveTab(tab)} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === tab ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 {tab === 'video' ? <Tv size={15} /> : <Music size={15} />}
+//                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+//               </button>
+//             ))}
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{
+//             background: '#333', border: 'none', borderRadius: '50%',
+//             width: '36px', height: '36px', cursor: 'pointer',
+//             display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//           }}>
+//             <X size={18} />
+//           </button>
+//         </div>
+
+//         {/* Content area */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{
+//             display: activeTab === 'video' ? 'flex' : 'none',
+//             flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+//           }}>
+//             <div style={{
+//               width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//               borderRadius: '12px', overflow: 'hidden',
+//               position: 'relative', background: '#000'
+//             }}>
+//               {/* ✅ Player always lives here — never unmounted */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {/* Custom controls overlay */}
+//               <div style={{
+//                 position: 'absolute', bottom: 0, left: 0, right: 0,
+//                 padding: '50px 16px 12px',
+//                 background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+//                 zIndex: 10, display: 'flex', flexDirection: 'column', gap: '8px'
+//               }}>
+//                 {/* Seekbar */}
+//                 <div onClick={handleSeek} style={{
+//                   width: '100%', height: '4px',
+//                   background: 'rgba(255,255,255,0.3)',
+//                   borderRadius: '2px', cursor: 'pointer'
+//                 }}>
+//                   <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                 </div>
+//                 {/* Buttons */}
+//                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                   <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                     <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                       style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasPrev && playPrev()} />
+//                     <button onClick={togglePlay} style={{
+//                       background: 'white', border: 'none', borderRadius: '50%',
+//                       width: '36px', height: '36px',
+//                       display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                     }}>
+//                       {isPlaying
+//                         ? <Pause size={18} color="black" />
+//                         : <Play  size={18} color="black" fill="black" />}
+//                     </button>
+//                     <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                       style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                       onClick={() => hasNext && playNext()} />
+//                     <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                       {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                     </div>
+//                     <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                       onChange={handleVolumeChange}
+//                       style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                   </div>
+//                   <button onClick={handleFullscreen} style={{
+//                     background: 'transparent', border: 'none',
+//                     cursor: 'pointer', color: 'white',
+//                     display: 'flex', alignItems: 'center', gap: '4px'
+//                   }}>
+//                     <Maximize2 size={18} />
+//                   </button>
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{
+//               flex: 1, display: 'flex', gap: '40px',
+//               padding: '30px 60px', overflowY: 'auto'
+//             }}>
+//               <div style={{ flexShrink: 0 }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title}
+//                   style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }} />
+//                 <div style={{ marginTop: '16px', fontWeight: 'bold' }}>{currentSong.title}</div>
+//                 <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//               </div>
+//               <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Lyrics tab footer controls */}
+//         {activeTab === 'lyrics' && (
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying
+//                   ? <Pause size={26} color="black" />
+//                   : <Play  size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         )}
+//       </div>
+
+//       {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Song info — click to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }}
+//           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{
+//               position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying
+//                 ? <Pause size={24} color="black" />
+//                 : <Play  size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+// above code is  for removing buffering
+  //below code is not workinhg for hidding youtube buttonss
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+//   const playerRef = useRef(null);
+//   const containerRef = useRef(null);        // hidden player container
+//   const modalPlayerRef = useRef(null);      // modal video container
+//   const [progress, setProgress] = useState(0);
+//   const [volume, setVolume] = useState(100);
+//   const [isMuted, setIsMuted] = useState(false);
+//   const [showModal, setShowModal] = useState(false);
+//   const [activeTab, setActiveTab] = useState('video'); // 'video' | 'lyrics'
+//   const [lyrics, setLyrics] = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [lyricsError, setLyricsError] = useState(false);
+//   const progressInterval = useRef(null);
+//   const isReady = useRef(false);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics fetch via LRCLIB (free, no API key) ──────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyricsError(false);
+//     setLyrics('');
+//     try {
+//       // Clean title: strip "[Official Video]", "(Audio)", etc.
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')
+//         .replace(/\[.*?\]/g, '')
+//         .trim();
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '')  // YouTube auto-generated "Artist - Topic"
+//         .trim();
+
+//       const res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+
+//       if (res.data && res.data.length > 0) {
+//         const match = res.data[0];
+//         // Prefer plain lyrics over synced LRC format
+//         const text = match.plainLyrics || match.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '') || '';
+//         setLyrics(text || 'Lyrics not available for this song.');
+//       } else {
+//         setLyrics('Lyrics not found for this song.');
+//       }
+//     } catch (err) {
+//       console.error('Lyrics fetch error:', err);
+//       setLyricsError(true);
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   // Fetch lyrics whenever song changes
+//   useEffect(() => {
+//     if (currentSong) fetchLyrics(currentSong);
+//   }, [currentSong, fetchLyrics]);
+
+//   // ── YouTube IFrame API ───────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   const buildPlayer = (container, videoId, onReadyCb) => {
+//     return new window.YT.Player(container, {
+//       height: '100%',
+//       width: '100%',
+//       videoId,
+//       playerVars: {
+//         autoplay: 1,
+//         controls: showModal ? 1 : 0,
+//         disablekb: 0,
+//         fs: 1,
+//         iv_load_policy: 3,
+//         modestbranding: 1,
+//         rel: 0,
+//         playsinline: 1
+//       },
+//       events: {
+//         onReady: onReadyCb,
+//         onStateChange: (e) => {
+//           if (e.data === window.YT.PlayerState.PLAYING) {
+//             setIsPlaying(true);
+//             startProgressTracking();
+//           } else if (e.data === window.YT.PlayerState.PAUSED) {
+//             setIsPlaying(false);
+//             stopProgressTracking();
+//           } else if (e.data === window.YT.PlayerState.ENDED) {
+//             stopProgressTracking();
+//             setProgress(0);
+//             playNext();
+//           }
+//         },
+//         onError: (e) => {
+//           if (e.data === 101 || e.data === 150) playNext();
+//           else setIsPlaying(false);
+//         }
+//       }
+//     });
+//   };
+
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       if (playerRef.current && isReady.current) {
+//         playerRef.current.unMute();
+//         playerRef.current.setVolume(volume);
+//         setIsMuted(false);
+//         playerRef.current.loadVideoById(currentSong.youtube_id);
+//       } else {
+//         playerRef.current = buildPlayer(containerRef.current, currentSong.youtube_id, (event) => {
+//           isReady.current = true;
+//           event.target.unMute();
+//           event.target.setVolume(volume);
+//           event.target.playVideo();
+//         });
+//       }
+//     };
+
+//     if (window.YT && window.YT.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]);
+
+//   // When modal opens, mount a visible player inside modal
+//   useEffect(() => {
+//     if (!showModal || !currentSong || !isReady.current) return;
+//     if (!window.YT || !window.YT.Player) return;
+
+//     // Sync modal player with current playback position
+//     const currentTime = playerRef.current?.getCurrentTime?.() || 0;
+
+//     if (modalPlayerRef.current) {
+//       modalPlayerRef.current = buildPlayer(
+//         document.getElementById('modal-yt-player'),
+//         currentSong.youtube_id,
+//         (event) => {
+//           event.target.unMute();
+//           event.target.setVolume(volume);
+//           event.target.seekTo(currentTime, true);
+//           if (isPlaying) event.target.playVideo();
+//         }
+//       );
+//     }
+//   }, [showModal, currentSong, isPlaying, volume]);
+
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying, volume]);
+
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const current = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((current / total) * 100);
+//       }
+//     }, 500);
+//   };
+
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width = e.currentTarget.offsetWidth;
+//     const total = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   if (!currentSong) return null;
+
+//   // ── Format lyrics with line breaks ──────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() === '' ? 'transparent' : '#fff',
+//         fontSize: '1rem',
+//         lineHeight: '1.8',
+//         minHeight: '1.8rem'
+//       }}>
+//         {line || '​'}
+//       </p>
+//     ));
+//   };
+
+//   return (
+//     <>
+//       {/* ── FULL SCREEN MODAL ─────────────────────────────────────── */}
+//       {showModal && (
+//         <div style={{
+//           position: 'fixed', inset: 0, zIndex: 2000,
+//           background: 'rgba(0,0,0,0.95)',
+//           display: 'flex', flexDirection: 'column'
+//         }}>
+//           {/* Modal Header */}
+//           <div style={{
+//             display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//             padding: '16px 24px', borderBottom: '1px solid #333'
+//           }}>
+//             <div>
+//               <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//               <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//             </div>
+//             {/* Tab Switcher */}
+//             <div style={{ display: 'flex', gap: '8px' }}>
+//               <button onClick={() => setActiveTab('video')} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === 'video' ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 <Tv size={15} /> Video
+//               </button>
+//               <button onClick={() => setActiveTab('lyrics')} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === 'lyrics' ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 <Music size={15} /> Lyrics
+//               </button>
+//             </div>
+//             <button onClick={() => setShowModal(false)} style={{
+//               background: '#333', border: 'none', borderRadius: '50%',
+//               width: '36px', height: '36px', cursor: 'pointer',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//             }}>
+//               <X size={18} />
+//             </button>
+//           </div>
+
+//           {/* Modal Content */}
+//           <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+//             {/* VIDEO TAB */}
+//             {activeTab === 'video' && (
+//               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+//                 <div style={{
+//                   width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+//                   borderRadius: '12px', overflow: 'hidden', position: 'relative'
+//                 }}>
+//                   {/* YouTube iframe with controls=0 — we build our own controls */}
+//                   <iframe
+//                     id="modal-yt-iframe"
+//                     width="100%"
+//                     height="100%"
+//                     src={`https://www.youtube.com/embed/${currentSong.youtube_id}?autoplay=1&start=${Math.floor(playerRef.current?.getCurrentTime?.() || 0)}&controls=0&modestbranding=1&rel=0&iv_load_policy=3&playsinline=1&enablejsapi=1`}
+//                     title={currentSong.title}
+//                     frameBorder="0"
+//                     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+//                     allowFullScreen
+//                     style={{ borderRadius: '12px', display: 'block' }}
+//                   />
+
+//                   {/* Transparent overlay — blocks YouTube buttons from being clicked */}
+//                   <div style={{
+//                     position: 'absolute', inset: 0,
+//                     background: 'transparent',
+//                     zIndex: 1
+//                   }} />
+
+//                   {/* Custom controls overlay at bottom */}
+//                   <div style={{
+//                     position: 'absolute', bottom: 0, left: 0, right: 0,
+//                     padding: '30px 16px 12px',
+//                     background: 'linear-gradient(transparent, rgba(0,0,0,0.85))',
+//                     zIndex: 2,
+//                     display: 'flex', flexDirection: 'column', gap: '8px'
+//                   }}>
+//                     {/* Progress bar */}
+//                     <div
+//                       onClick={handleSeek}
+//                       style={{
+//                         width: '100%', height: '4px', background: 'rgba(255,255,255,0.3)',
+//                         borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//                       }}
+//                     >
+//                       <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                     </div>
+
+//                     {/* Buttons row */}
+//                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                       <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                         {/* Prev */}
+//                         <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+//                           style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                           onClick={() => hasPrev && playPrev()} />
+//                         {/* Play/Pause */}
+//                         <button onClick={togglePlay} style={{
+//                           background: 'white', border: 'none', borderRadius: '50%',
+//                           width: '36px', height: '36px', display: 'flex',
+//                           alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//                         }}>
+//                           {isPlaying ? <Pause size={18} color="black" /> : <Play size={18} color="black" fill="black" />}
+//                         </button>
+//                         {/* Next */}
+//                         <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+//                           style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                           onClick={() => hasNext && playNext()} />
+//                         {/* Volume */}
+//                         <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                           {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                         </div>
+//                         <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//                           onChange={handleVolumeChange}
+//                           style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                       </div>
+
+//                       {/* Fullscreen button */}
+//                       <button
+//                         onClick={() => {
+//                           const iframe = document.getElementById('modal-yt-iframe');
+//                           if (iframe?.requestFullscreen) iframe.requestFullscreen();
+//                           else if (iframe?.webkitRequestFullscreen) iframe.webkitRequestFullscreen();
+//                         }}
+//                         style={{
+//                           background: 'transparent', border: 'none', cursor: 'pointer',
+//                           color: 'white', display: 'flex', alignItems: 'center', gap: '4px',
+//                           fontSize: '13px'
+//                         }}
+//                       >
+//                         ⛶ Fullscreen
+//                       </button>
+//                     </div>
+//                   </div>
+//                 </div>
+//               </div>
+//             )}
+
+//             {/* LYRICS TAB */}
+//             {activeTab === 'lyrics' && (
+//               <div style={{
+//                 flex: 1, display: 'flex', gap: '40px',
+//                 padding: '30px 60px', overflowY: 'auto'
+//               }}>
+//                 {/* Album art */}
+//                 <div style={{ flexShrink: 0 }}>
+//                   <img
+//                     src={currentSong.image_url}
+//                     alt={currentSong.title}
+//                     style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }}
+//                   />
+//                   <div style={{ marginTop: '16px', fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//                 </div>
+//                 {/* Lyrics text */}
+//                 <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                   {renderLyrics()}
+//                 </div>
+//               </div>
+//             )}
+//           </div>
+
+//           {/* Modal Player Controls (mirrors main bar) */}
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px', display: 'flex',
+//                 alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying ? <Pause size={26} color="black" /> : <Play size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         </div>
+//       )}
+
+//       {/* ── PLAYER BAR ────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Hidden YouTube IFrame */}
+//         <div ref={containerRef} style={{
+//           position: 'absolute', bottom: '-10px', left: '-10px',
+//           width: '1px', height: '1px', overflow: 'hidden',
+//           pointerEvents: 'none', opacity: 0
+//         }} />
+
+//         {/* Song Info — click thumbnail or title to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }} onClick={() => setShowModal(true)}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title}
+//               style={{ transition: 'opacity 0.2s' }}
+//             />
+//             {/* Play icon overlay on hover */}
+//             <div style={{
+//               position: 'absolute', inset: 0,
+//               background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0,
+//               transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px', display: 'flex',
+//               alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying ? <Pause size={24} color="black" /> : <Play size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+//code for hidding youtbue butoton 
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv } from 'lucide-react';
+// import axios from 'axios';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+//   const playerRef = useRef(null);
+//   const containerRef = useRef(null);        // hidden player container
+//   const modalPlayerRef = useRef(null);      // modal video container
+//   const [progress, setProgress] = useState(0);
+//   const [volume, setVolume] = useState(100);
+//   const [isMuted, setIsMuted] = useState(false);
+//   const [showModal, setShowModal] = useState(false);
+//   const [activeTab, setActiveTab] = useState('video'); // 'video' | 'lyrics'
+//   const [lyrics, setLyrics] = useState('');
+//   const [lyricsLoading, setLyricsLoading] = useState(false);
+//   const [lyricsError, setLyricsError] = useState(false);
+//   const progressInterval = useRef(null);
+//   const isReady = useRef(false);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // ── Lyrics fetch via LRCLIB (free, no API key) ──────────────────────────
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setLyricsError(false);
+//     setLyrics('');
+//     try {
+//       // Clean title: strip "[Official Video]", "(Audio)", etc.
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '')
+//         .replace(/\[.*?\]/g, '')
+//         .trim();
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '')  // YouTube auto-generated "Artist - Topic"
+//         .trim();
+
+//       const res = await axios.get('https://lrclib.net/api/search', {
+//         params: { q: `${cleanTitle} ${cleanArtist}` }
+//       });
+
+//       if (res.data && res.data.length > 0) {
+//         const match = res.data[0];
+//         // Prefer plain lyrics over synced LRC format
+//         const text = match.plainLyrics || match.syncedLyrics?.replace(/\[\d+:\d+\.\d+\]/g, '') || '';
+//         setLyrics(text || 'Lyrics not available for this song.');
+//       } else {
+//         setLyrics('Lyrics not found for this song.');
+//       }
+//     } catch (err) {
+//       console.error('Lyrics fetch error:', err);
+//       setLyricsError(true);
+//       setLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   // Fetch lyrics whenever song changes
+//   useEffect(() => {
+//     if (currentSong) fetchLyrics(currentSong);
+//   }, [currentSong, fetchLyrics]);
+
+//   // ── YouTube IFrame API ───────────────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   const buildPlayer = (container, videoId, onReadyCb) => {
+//     return new window.YT.Player(container, {
+//       height: '100%',
+//       width: '100%',
+//       videoId,
+//       playerVars: {
+//         autoplay: 1,
+//         controls: showModal ? 1 : 0,
+//         disablekb: 0,
+//         fs: 1,
+//         iv_load_policy: 3,
+//         modestbranding: 1,
+//         rel: 0,
+//         playsinline: 1
+//       },
+//       events: {
+//         onReady: onReadyCb,
+//         onStateChange: (e) => {
+//           if (e.data === window.YT.PlayerState.PLAYING) {
+//             setIsPlaying(true);
+//             startProgressTracking();
+//           } else if (e.data === window.YT.PlayerState.PAUSED) {
+//             setIsPlaying(false);
+//             stopProgressTracking();
+//           } else if (e.data === window.YT.PlayerState.ENDED) {
+//             stopProgressTracking();
+//             setProgress(0);
+//             playNext();
+//           }
+//         },
+//         onError: (e) => {
+//           if (e.data === 101 || e.data === 150) playNext();
+//           else setIsPlaying(false);
+//         }
+//       }
+//     });
+//   };
+
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       if (playerRef.current && isReady.current) {
+//         playerRef.current.unMute();
+//         playerRef.current.setVolume(volume);
+//         setIsMuted(false);
+//         playerRef.current.loadVideoById(currentSong.youtube_id);
+//       } else {
+//         playerRef.current = buildPlayer(containerRef.current, currentSong.youtube_id, (event) => {
+//           isReady.current = true;
+//           event.target.unMute();
+//           event.target.setVolume(volume);
+//           event.target.playVideo();
+//         });
+//       }
+//     };
+
+//     if (window.YT && window.YT.Player) initPlayer();
+//     else window.onYouTubeIframeAPIReady = initPlayer;
+//   }, [songKey]);
+
+//   // When modal opens, mount a visible player inside modal
+//   useEffect(() => {
+//     if (!showModal || !currentSong || !isReady.current) return;
+//     if (!window.YT || !window.YT.Player) return;
+
+//     // Sync modal player with current playback position
+//     const currentTime = playerRef.current?.getCurrentTime?.() || 0;
+
+//     if (modalPlayerRef.current) {
+//       modalPlayerRef.current = buildPlayer(
+//         document.getElementById('modal-yt-player'),
+//         currentSong.youtube_id,
+//         (event) => {
+//           event.target.unMute();
+//           event.target.setVolume(volume);
+//           event.target.seekTo(currentTime, true);
+//           if (isPlaying) event.target.playVideo();
+//         }
+//       );
+//     }
+//   }, [showModal, currentSong, isPlaying, volume]);
+
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying, volume]);
+
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const current = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((current / total) * 100);
+//       }
+//     }, 500);
+//   };
+
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width = e.currentTarget.offsetWidth;
+//     const total = playerRef.current.getDuration();
+//     if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   if (!currentSong) return null;
+
+//   // ── Format lyrics with line breaks ──────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         Loading lyrics...
+//       </div>
+//     );
+//     return lyrics.split('\n').map((line, i) => (
+//       <p key={i} style={{
+//         margin: '2px 0',
+//         color: line.trim() === '' ? 'transparent' : '#fff',
+//         fontSize: '1rem',
+//         lineHeight: '1.8',
+//         minHeight: '1.8rem'
+//       }}>
+//         {line || '​'}
+//       </p>
+//     ));
+//   };
+
+//   return (
+//     <>
+//       {/* ── FULL SCREEN MODAL ─────────────────────────────────────── */}
+//       {showModal && (
+//         <div style={{
+//           position: 'fixed', inset: 0, zIndex: 2000,
+//           background: 'rgba(0,0,0,0.95)',
+//           display: 'flex', flexDirection: 'column'
+//         }}>
+//           {/* Modal Header */}
+//           <div style={{
+//             display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+//             padding: '16px 24px', borderBottom: '1px solid #333'
+//           }}>
+//             <div>
+//               <div style={{ fontWeight: 'bold', fontSize: '1.1rem' }}>{currentSong.title}</div>
+//               <div style={{ color: '#b3b3b3', fontSize: '0.85rem' }}>{currentSong.artist}</div>
+//             </div>
+//             {/* Tab Switcher */}
+//             <div style={{ display: 'flex', gap: '8px' }}>
+//               <button onClick={() => setActiveTab('video')} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === 'video' ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 <Tv size={15} /> Video
+//               </button>
+//               <button onClick={() => setActiveTab('lyrics')} style={{
+//                 padding: '8px 18px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//                 background: activeTab === 'lyrics' ? '#1db954' : '#333',
+//                 color: 'white', display: 'flex', alignItems: 'center', gap: '6px'
+//               }}>
+//                 <Music size={15} /> Lyrics
+//               </button>
+//             </div>
+//             <button onClick={() => setShowModal(false)} style={{
+//               background: '#333', border: 'none', borderRadius: '50%',
+//               width: '36px', height: '36px', cursor: 'pointer',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white'
+//             }}>
+//               <X size={18} />
+//             </button>
+//           </div>
+
+//           {/* Modal Content */}
+//           <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+//             {/* VIDEO TAB */}
+//             {activeTab === 'video' && (
+//               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+//                 <div style={{ width: '100%', maxWidth: '900px', aspectRatio: '16/9', borderRadius: '12px', overflow: 'hidden' }}>
+//                   <iframe
+//                     width="100%"
+//                     height="100%"
+//                     src={`https://www.youtube.com/embed/${currentSong.youtube_id}?autoplay=1&start=${Math.floor(playerRef.current?.getCurrentTime?.() || 0)}&enablejsapi=1`}
+//                     title={currentSong.title}
+//                     frameBorder="0"
+//                     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+//                     allowFullScreen
+//                     style={{ borderRadius: '12px' }}
+//                   />
+//                 </div>
+//               </div>
+//             )}
+
+//             {/* LYRICS TAB */}
+//             {activeTab === 'lyrics' && (
+//               <div style={{
+//                 flex: 1, display: 'flex', gap: '40px',
+//                 padding: '30px 60px', overflowY: 'auto'
+//               }}>
+//                 {/* Album art */}
+//                 <div style={{ flexShrink: 0 }}>
+//                   <img
+//                     src={currentSong.image_url}
+//                     alt={currentSong.title}
+//                     style={{ width: '220px', height: '220px', borderRadius: '12px', objectFit: 'cover' }}
+//                   />
+//                   <div style={{ marginTop: '16px', fontWeight: 'bold', fontSize: '1rem' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.85rem', marginTop: '4px' }}>{currentSong.artist}</div>
+//                 </div>
+//                 {/* Lyrics text */}
+//                 <div style={{ flex: 1, overflowY: 'auto', paddingRight: '10px' }}>
+//                   {renderLyrics()}
+//                 </div>
+//               </div>
+//             )}
+//           </div>
+
+//           {/* Modal Player Controls (mirrors main bar) */}
+//           <div style={{
+//             padding: '12px 24px 20px', borderTop: '1px solid #333',
+//             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+//           }}>
+//             <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//               <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+//                 style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasPrev && playPrev()} />
+//               <button onClick={togglePlay} style={{
+//                 background: 'white', border: 'none', borderRadius: '50%',
+//                 width: '48px', height: '48px', display: 'flex',
+//                 alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//               }}>
+//                 {isPlaying ? <Pause size={26} color="black" /> : <Play size={26} color="black" fill="black" />}
+//               </button>
+//               <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+//                 style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//                 onClick={() => hasNext && playNext()} />
+//             </div>
+//             <div onClick={handleSeek} style={{
+//               width: '60%', height: '4px', background: '#444',
+//               borderRadius: '2px', cursor: 'pointer'
+//             }}>
+//               <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//             </div>
+//           </div>
+//         </div>
+//       )}
+
+//       {/* ── PLAYER BAR ────────────────────────────────────────────── */}
+//       <div className="player-bar">
+
+//         {/* Hidden YouTube IFrame */}
+//         <div ref={containerRef} style={{
+//           position: 'absolute', bottom: '-10px', left: '-10px',
+//           width: '1px', height: '1px', overflow: 'hidden',
+//           pointerEvents: 'none', opacity: 0
+//         }} />
+
+//         {/* Song Info — click thumbnail or title to open modal */}
+//         <div className="player-info" style={{ cursor: 'pointer' }} onClick={() => setShowModal(true)}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title}
+//               style={{ transition: 'opacity 0.2s' }}
+//             />
+//             {/* Play icon overlay on hover */}
+//             <div style={{
+//               position: 'absolute', inset: 0,
+//               background: 'rgba(0,0,0,0.5)',
+//               display: 'flex', alignItems: 'center', justifyContent: 'center',
+//               borderRadius: '4px', opacity: 0,
+//               transition: 'opacity 0.2s'
+//             }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1}
+//               onMouseLeave={e => e.currentTarget.style.opacity = 0}
+//             >
+//               <Tv size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//                 {currentIndex + 1} / {queue.length} in playlist
+//               </div>
+//             )}
+//           </div>
+//         </div>
+
+//         {/* Controls */}
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <SkipBack size={20} fill={hasPrev ? 'white' : '#555'}
+//               style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{
+//               background: 'white', border: 'none', borderRadius: '50%',
+//               width: '40px', height: '40px', display: 'flex',
+//               alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+//             }}>
+//               {isPlaying ? <Pause size={24} color="black" /> : <Play size={24} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={20} fill={hasNext ? 'white' : '#555'}
+//               style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//               onClick={() => hasNext && playNext()} />
+//           </div>
+//           <div onClick={handleSeek} style={{
+//             width: '100%', height: '4px', background: '#444',
+//             borderRadius: '2px', cursor: 'pointer', position: 'relative'
+//           }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         {/* Volume */}
+//         <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+//             onChange={handleVolumeChange}
+//             style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
+
+//updated for video and songlist 
+
+
+// import React, { useContext, useEffect, useRef, useState } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-react';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue } = useContext(MusicContext);
+//   const playerRef = useRef(null);
+//   const containerRef = useRef(null);
+//   const [progress, setProgress] = useState(0);
+//   const [volume, setVolume] = useState(100);
+//   const [isMuted, setIsMuted] = useState(false);
+//   const progressInterval = useRef(null);
+//   const isReady = useRef(false);
+
+//   // Current song index in queue for disabling prev/next buttons
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   // Load YouTube IFrame API script once
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // When a new song is selected, create or reload the YouTube player
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       if (playerRef.current && isReady.current) {
+//         playerRef.current.unMute();
+//         playerRef.current.setVolume(volume);
+//         setIsMuted(false);
+//         playerRef.current.loadVideoById(currentSong.youtube_id);
+//       } else {
+//         playerRef.current = new window.YT.Player(containerRef.current, {
+//           height: '1',
+//           width: '1',
+//           videoId: currentSong.youtube_id,
+//           playerVars: {
+//             autoplay: 1,
+//             controls: 0,
+//             disablekb: 1,
+//             fs: 0,
+//             iv_load_policy: 3,
+//             modestbranding: 1,
+//             rel: 0,
+//             playsinline: 1
+//           },
+//           events: {
+//             onReady: (event) => {
+//               isReady.current = true;
+//               event.target.unMute();
+//               event.target.setVolume(volume);
+//               event.target.playVideo();
+//             },
+//             onStateChange: (e) => {
+//               if (e.data === window.YT.PlayerState.PLAYING) {
+//                 setIsPlaying(true);
+//                 startProgressTracking();
+//               } else if (e.data === window.YT.PlayerState.PAUSED) {
+//                 setIsPlaying(false);
+//                 stopProgressTracking();
+//               } else if (e.data === window.YT.PlayerState.ENDED) {
+//                 stopProgressTracking();
+//                 setProgress(0);
+//                 playNext(); // ✅ Auto-play next song in queue when current ends
+//               }
+//             },
+//             onError: (e) => {
+//               console.error('YouTube Player Error code:', e.data);
+//               // If video is unplayable (101/150), skip to next automatically
+//               if (e.data === 101 || e.data === 150) {
+//                 playNext();
+//               } else {
+//                 setIsPlaying(false);
+//               }
+//             }
+//           }
+//         });
+//       }
+//     };
+
+//     if (window.YT && window.YT.Player) {
+//       initPlayer();
+//     } else {
+//       window.onYouTubeIframeAPIReady = initPlayer;
+//     }
+//   }, [songKey]);
+
+//   // Play/pause toggle
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]);
+
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current && playerRef.current.getCurrentTime) {
+//         const current = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((current / total) * 100);
+//       }
+//     }, 500);
+//   };
+
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+
+//   useEffect(() => {
+//     return () => stopProgressTracking();
+//   }, []);
+
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const bar = e.currentTarget;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width = bar.offsetWidth;
+//     const total = playerRef.current.getDuration();
+//     if (total > 0) {
+//       playerRef.current.seekTo((clickX / width) * total, true);
+//     }
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) {
+//         playerRef.current.mute();
+//         setIsMuted(true);
+//       } else {
+//         playerRef.current.unMute();
+//         setIsMuted(false);
+//       }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <div className="player-bar">
+
+//       {/* Hidden YouTube IFrame */}
+//       <div
+//         ref={containerRef}
+//         style={{
+//           position: 'absolute',
+//           bottom: '-10px',
+//           left: '-10px',
+//           width: '1px',
+//           height: '1px',
+//           overflow: 'hidden',
+//           pointerEvents: 'none',
+//           opacity: 0
+//         }}
+//       />
+
+//       {/* Song Info */}
+//       <div className="player-info">
+//         <img src={currentSong.image_url} alt={currentSong.title} />
+//         <div>
+//           <div className="song-title">{currentSong.title}</div>
+//           <div className="song-artist">{currentSong.artist}</div>
+//           {/* Show queue position if playing from a playlist */}
+//           {queue.length > 0 && currentIndex >= 0 && (
+//             <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+//               {currentIndex + 1} / {queue.length} in playlist
+//             </div>
+//           )}
+//         </div>
+//       </div>
+
+//       {/* Controls */}
+//       <div className="player-controls">
+//         <div className="control-buttons">
+//           {/* Prev button — greyed out if no previous song */}
+//           <SkipBack
+//             size={20}
+//             fill={hasPrev ? 'white' : '#555'}
+//             style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+//             onClick={() => hasPrev && playPrev()}
+//           />
+//           <button
+//             onClick={togglePlay}
+//             style={{
+//               background: 'white',
+//               border: 'none',
+//               borderRadius: '50%',
+//               width: '40px',
+//               height: '40px',
+//               display: 'flex',
+//               alignItems: 'center',
+//               justifyContent: 'center',
+//               cursor: 'pointer'
+//             }}
+//           >
+//             {isPlaying
+//               ? <Pause size={24} color="black" />
+//               : <Play size={24} color="black" fill="black" />
+//             }
+//           </button>
+//           {/* Next button — greyed out if no next song */}
+//           <SkipForward
+//             size={20}
+//             fill={hasNext ? 'white' : '#555'}
+//             style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+//             onClick={() => hasNext && playNext()}
+//           />
+//         </div>
+
+//         {/* Progress Bar */}
+//         <div
+//           onClick={handleSeek}
+//           style={{
+//             width: '100%',
+//             height: '4px',
+//             background: '#444',
+//             borderRadius: '2px',
+//             cursor: 'pointer',
+//             position: 'relative'
+//           }}
+//         >
+//           <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//         </div>
+//       </div>
+
+//       {/* Volume Control */}
+//       <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//         <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//           {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//         </div>
+//         <input
+//           type="range"
+//           min="0"
+//           max="100"
+//           value={isMuted ? 0 : volume}
+//           onChange={handleVolumeChange}
+//           style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }}
+//         />
+//       </div>
+//     </div>
+//   );
+// };
+
+// export default PlayerBar;
+
+
+
+
+// MusicContext.js — add a queue state (the active playlist songs) and a playNext function
+// LibraryPage.js — when user clicks a song, pass the full playlist as the queue
+// SongList.js — pass queue to playSong when inside a playlist
+// PlayerBar.js — call playNext when a song ends instead of just stopping
+// import React, { useContext, useEffect, useRef, useState } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX } from 'lucide-react';
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying } = useContext(MusicContext);
+//   const playerRef = useRef(null);
+//   const containerRef = useRef(null);
+//   const [progress, setProgress] = useState(0);
+//   const [volume, setVolume] = useState(100);
+//   const [isMuted, setIsMuted] = useState(false);
+//   const progressInterval = useRef(null);
+//   const isReady = useRef(false);
+
+//   // Load YouTube IFrame API script once
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // When a new song is selected, create or reload the YouTube player
+//   useEffect(() => {
+//     if (!currentSong) return;
+
+//     const initPlayer = () => {
+//       if (playerRef.current && isReady.current) {
+//         // Player already exists — unmute, set full volume, load new video
+//         playerRef.current.unMute();
+//         playerRef.current.setVolume(100);
+//         setIsMuted(false);
+//         setVolume(100);
+//         playerRef.current.loadVideoById(currentSong.youtube_id);
+//       } else {
+//         // First time — create a fresh player
+//         // containerRef might have been replaced by YT, so ensure div exists
+//         playerRef.current = new window.YT.Player(containerRef.current, {
+//           height: '1',
+//           width: '1',
+//           videoId: currentSong.youtube_id,
+//           playerVars: {
+//             autoplay: 1,
+//             controls: 0,
+//             disablekb: 1,
+//             fs: 0,
+//             iv_load_policy: 3,
+//             modestbranding: 1,
+//             rel: 0,
+//             playsinline: 1
+//           },
+//           events: {
+//             onReady: (event) => {
+//               isReady.current = true;
+//               event.target.unMute();        // ✅ KEY FIX: force unmute on ready
+//               event.target.setVolume(100);  // ✅ KEY FIX: set full volume
+//               event.target.playVideo();
+//             },
+//             onStateChange: (e) => {
+//               if (e.data === window.YT.PlayerState.PLAYING) {
+//                 setIsPlaying(true);
+//                 startProgressTracking();
+//               } else if (e.data === window.YT.PlayerState.PAUSED) {
+//                 setIsPlaying(false);
+//                 stopProgressTracking();
+//               } else if (e.data === window.YT.PlayerState.ENDED) {
+//                 setIsPlaying(false);
+//                 setProgress(0);
+//                 stopProgressTracking();
+//               }
+//             },
+//             onError: (e) => {
+//               console.error('YouTube Player Error code:', e.data);
+//               // Error 101/150 = video embedding disabled by owner
+//               setIsPlaying(false);
+//             }
+//           }
+//         });
+//       }
+//     };
+
+//     if (window.YT && window.YT.Player) {
+//       initPlayer();
+//     } else {
+//       window.onYouTubeIframeAPIReady = initPlayer;
+//     }
+//   }, [songKey]);
+
+//   // Play/pause toggle
+//   useEffect(() => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying]);
+
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current && playerRef.current.getCurrentTime) {
+//         const current = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((current / total) * 100);
+//       }
+//     }, 500);
+//   };
+
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+
+//   useEffect(() => {
+//     return () => stopProgressTracking();
+//   }, []);
+
+//   const handleSeek = (e) => {
+//     if (!playerRef.current || !isReady.current) return;
+//     const bar = e.currentTarget;
+//     const clickX = e.nativeEvent.offsetX;
+//     const width = bar.offsetWidth;
+//     const total = playerRef.current.getDuration();
+//     if (total > 0) {
+//       playerRef.current.seekTo((clickX / width) * total, true);
+//     }
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) {
+//         playerRef.current.mute();
+//         setIsMuted(true);
+//       } else {
+//         playerRef.current.unMute();
+//         setIsMuted(false);
+//       }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isMuted) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume || 100);
+//       setIsMuted(false);
+//     } else {
+//       playerRef.current.mute();
+//       setIsMuted(true);
+//     }
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <div className="player-bar">
+
+//       {/* Hidden YouTube IFrame — must stay in DOM for audio */}
+//       <div
+//         ref={containerRef}
+//         style={{
+//           position: 'absolute',
+//           bottom: '-10px',
+//           left: '-10px',
+//           width: '1px',
+//           height: '1px',
+//           overflow: 'hidden',
+//           pointerEvents: 'none',
+//           opacity: 0
+//         }}
+//       />
+
+//       {/* Song Info */}
+//       <div className="player-info">
+//         <img src={currentSong.image_url} alt={currentSong.title} />
+//         <div>
+//           <div className="song-title">{currentSong.title}</div>
+//           <div className="song-artist">{currentSong.artist}</div>
+//         </div>
+//       </div>
+
+//       {/* Controls */}
+//       <div className="player-controls">
+//         <div className="control-buttons">
+//           <SkipBack size={20} fill="white" style={{ cursor: 'pointer' }} />
+//           <button
+//             onClick={togglePlay}
+//             style={{
+//               background: 'white',
+//               border: 'none',
+//               borderRadius: '50%',
+//               width: '40px',
+//               height: '40px',
+//               display: 'flex',
+//               alignItems: 'center',
+//               justifyContent: 'center',
+//               cursor: 'pointer'
+//             }}
+//           >
+//             {isPlaying
+//               ? <Pause size={24} color="black" />
+//               : <Play size={24} color="black" fill="black" />
+//             }
+//           </button>
+//           <SkipForward size={20} fill="white" style={{ cursor: 'pointer' }} />
+//         </div>
+
+//         {/* Progress Bar */}
+//         <div
+//           onClick={handleSeek}
+//           style={{
+//             width: '100%',
+//             height: '4px',
+//             background: '#444',
+//             borderRadius: '2px',
+//             cursor: 'pointer',
+//             position: 'relative'
+//           }}
+//         >
+//           <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//         </div>
+//       </div>
+
+//       {/* Volume Control */}
+//       <div style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//         <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//           {isMuted || volume === 0
+//             ? <VolumeX size={20} />
+//             : <Volume2 size={20} />
+//           }
+//         </div>
+//         <input
+//           type="range"
+//           min="0"
+//           max="100"
+//           value={isMuted ? 0 : volume}
+//           onChange={handleVolumeChange}
+//           style={{
+//             width: '80px',
+//             accentColor: '#1db954',
+//             cursor: 'pointer'
+//           }}
+//         />
+//       </div>
+//     </div>
+//   );
+// };
+
+// export default PlayerBar;
+
