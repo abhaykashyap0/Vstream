@@ -25,7 +25,7 @@ app.use('/api/auth',      authRoutes);
 app.use('/api/search',    searchRoutes);
 app.use('/api/playlists', playlistRoutes);
 
-const PORT = process.env.REACT_APP_API_URL || 5000;
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`VStream server running on port ${PORT}`);
   startKeepAlive(); // ✅ Start keep-alive pings (only active on Render)
