@@ -1,8 +1,9 @@
-
 import React, { useState, useContext } from 'react';
 import axios from 'axios';
 import { Search } from 'lucide-react';
 import { AuthContext } from '../context/AuthContext';
+
+const API = process.env.REACT_APP_API_URL || '';
 
 const SearchBar = ({ onResults }) => {
   const [query, setQuery]         = useState('');
@@ -16,7 +17,7 @@ const SearchBar = ({ onResults }) => {
     setQuotaError(false);
     try {
       const headers = user ? { Authorization: `Bearer ${user.token}` } : {};
-      const { data } = await axios.get(`/api/search?q=${encodeURIComponent(searchQuery)}`, { headers });
+      const { data } = await axios.get(`${API}/api/search?q=${encodeURIComponent(searchQuery)}`, { headers });
       // Ensure always array — search returns array, suggestions returns {type,songs}
       onResults(Array.isArray(data) ? data : (data.songs || []));
     } catch (err) {
@@ -79,6 +80,86 @@ const SearchBar = ({ onResults }) => {
 };
 
 export default SearchBar;
+// import React, { useState, useContext } from 'react';
+// import axios from 'axios';
+// import { Search } from 'lucide-react';
+// import { AuthContext } from '../context/AuthContext';
+
+// const SearchBar = ({ onResults }) => {
+//   const [query, setQuery]         = useState('');
+//   const [loading, setLoading]     = useState(false);
+//   const [quotaError, setQuotaError] = useState(false);
+//   const { user }                  = useContext(AuthContext);
+
+//   const performSearch = async (searchQuery) => {
+//     if (!searchQuery.trim()) return;
+//     setLoading(true);
+//     setQuotaError(false);
+//     try {
+//       const headers = user ? { Authorization: `Bearer ${user.token}` } : {};
+//       const { data } = await axios.get(`/api/search?q=${encodeURIComponent(searchQuery)}`, { headers });
+//       // Ensure always array — search returns array, suggestions returns {type,songs}
+//       onResults(Array.isArray(data) ? data : (data.songs || []));
+//     } catch (err) {
+//       if (err.response?.status === 429) { setQuotaError(true); onResults([]); }
+//       console.error(err);
+//     } finally { setLoading(false); }
+//   };
+
+//   const handleKeyDown = (e) => { if (e.key === 'Enter') performSearch(query); };
+
+//   const handleClear = () => { setQuery(''); onResults([]); setQuotaError(false); };
+
+//   return (
+//     <div className="search-container">
+//       <div style={{ position: 'relative' }}>
+//         <Search
+//           onClick={() => performSearch(query)}
+//           style={{
+//             position: 'absolute', left: '15px', top: '12px',
+//             color: loading ? '#1db954' : '#b3b3b3', cursor: 'pointer', transition: 'color 0.2s'
+//           }}
+//           size={20}
+//         />
+//         <input
+//           type="text"
+//           className="search-input"
+//           placeholder="Search for songs or artists... (press Enter)"
+//           value={query}
+//           onChange={(e) => { setQuery(e.target.value); setQuotaError(false); if (!e.target.value) handleClear(); }}
+//           onKeyDown={handleKeyDown}
+//           style={{ paddingLeft: '45px', paddingRight: query ? '40px' : '16px' }}
+//         />
+//         {query && (
+//           <button onClick={handleClear} style={{
+//             position: 'absolute', right: '14px', top: '10px',
+//             background: 'transparent', border: 'none',
+//             color: '#b3b3b3', cursor: 'pointer', fontSize: '18px', lineHeight: 1
+//           }}>✕</button>
+//         )}
+//         {loading && (
+//           <span style={{ position: 'absolute', right: '40px', top: '12px', color: '#1db954', fontSize: '0.8rem' }}>
+//             Searching...
+//           </span>
+//         )}
+//       </div>
+//       <div style={{ marginTop: '8px', color: '#666', fontSize: '0.78rem', paddingLeft: '4px' }}>
+//         Tip: Press <kbd style={{ background: '#333', padding: '1px 6px', borderRadius: '4px', fontSize: '0.75rem', color: '#ccc' }}>Enter</kbd> to search
+//       </div>
+//       {quotaError && (
+//         <div style={{
+//           marginTop: '10px', padding: '10px 16px',
+//           background: '#2a1a1a', border: '1px solid #ff4444',
+//           borderRadius: '8px', color: '#ff6666', fontSize: '0.85rem'
+//         }}>
+//           ⚠️ Daily search limit reached. Try again tomorrow, or play from your Library.
+//         </div>
+//       )}
+//     </div>
+//   );
+// };
+
+// export default SearchBar;
 //AFTER DEPLOYMENT MANIFEST.JS CREATING PREBLEM SERACHBAR.JS AND SONGLIST.JS CHANGE
 
 // import React, { useState, useContext } from 'react';
