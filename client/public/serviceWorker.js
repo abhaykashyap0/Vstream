@@ -1,20 +1,12 @@
-/* Service Worker — keeps app alive in background for audio playback */
+/* Service Worker — VStream */
 const CACHE_NAME = 'vstream-v1';
 
-// Install — cache basic app shell
 self.addEventListener('install', (e) => {
   self.skipWaiting();
-  e.waitUntil(
-    caches.open(CACHE_NAME).then(cache =>
-      cache.addAll(['/', '/index.html'])
-    )
-  );
 });
 
-// Activate
 self.addEventListener('activate', (e) => {
   self.clients.claim();
-  // Remove old caches
   e.waitUntil(
     caches.keys().then(keys =>
       Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
@@ -22,20 +14,41 @@ self.addEventListener('activate', (e) => {
   );
 });
 
-// Fetch — serve from cache when offline, network first when online
+// ✅ Fixed fetch handler — skip non-GET and opaque requests
 self.addEventListener('fetch', (e) => {
-  // Don't intercept API calls or YouTube
-  if (e.request.url.includes('/api/') ||
-      e.request.url.includes('youtube') ||
-      e.request.url.includes('googleapis')) {
-    return;
-  }
+  // Only handle GET requests
+  if (e.request.method !== 'GET') return;
+
+  // Skip API calls, YouTube, Firebase, external URLs
+  const url = e.request.url;
+  if (
+    url.includes('/api/') ||
+    url.includes('youtube') ||
+    url.includes('googleapis') ||
+    url.includes('firebase') ||
+    url.includes('lrclib') ||
+    url.includes('anthropic') ||
+    !url.startsWith('http')
+  ) return;
+
   e.respondWith(
-    fetch(e.request).catch(() => caches.match(e.request))
+    fetch(e.request)
+      .then(response => {
+        // Only cache valid same-origin responses
+        if (
+          !response ||
+          response.status !== 200 ||
+          response.type === 'opaque' ||
+          response.type === 'error'
+        ) {
+          return response;
+        }
+        return response;
+      })
+      .catch(() => caches.match(e.request))
   );
 });
 
-// Keep alive — respond to messages from main page
 self.addEventListener('message', (e) => {
   if (e.data === 'keepAlive') {
     e.ports[0]?.postMessage('alive');
