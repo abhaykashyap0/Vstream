@@ -6,6 +6,7 @@ import Navbar from './components/Navbar';
 import PlayerBar from './components/PlayerBar';
 import HomePage from './pages/HomePage';
 import LibraryPage from './pages/LibraryPage';
+import ProfilePage from './pages/ProfilePage';
 import Login from './pages/Login';
 import Signup from './pages/Signup';
 import './App.css';
@@ -24,6 +25,7 @@ function App() {
               <Route path="/library" element={<LibraryPage />} />
               <Route path="/login" element={<Login />} />
               <Route path="/signup" element={<Signup />} />
+              <Route path="/profile" element={<ProfilePage />} />
             </Routes>
             <PlayerBar />
           </div>
@@ -34,6 +36,44 @@ function App() {
 }
 
 export default App;
+
+
+// import React from 'react';
+// import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+// import { AuthProvider } from './context/AuthContext';
+// import { MusicProvider } from './context/MusicContext';
+// import Navbar from './components/Navbar';
+// import PlayerBar from './components/PlayerBar';
+// import HomePage from './pages/HomePage';
+// import LibraryPage from './pages/LibraryPage';
+// import Login from './pages/Login';
+// import Signup from './pages/Signup';
+// import './App.css';
+
+// function App() {
+//   return (
+//     // ✅ MusicProvider must be outside AuthProvider
+//     // so AuthContext can access resetPlayer from MusicContext
+//     <MusicProvider>
+//       <AuthProvider>
+//         <Router>
+//           <div className="app-container">
+//             <Navbar />
+//             <Routes>
+//               <Route path="/" element={<HomePage />} />
+//               <Route path="/library" element={<LibraryPage />} />
+//               <Route path="/login" element={<Login />} />
+//               <Route path="/signup" element={<Signup />} />
+//             </Routes>
+//             <PlayerBar />
+//           </div>
+//         </Router>
+//       </AuthProvider>
+//     </MusicProvider>
+//   );
+// }
+
+// export default App;
 
 
 // On logout → stop music, clear player bar

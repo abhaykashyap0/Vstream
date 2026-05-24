@@ -9,6 +9,7 @@ const { startKeepAlive } = require('./keepAlive');
 const authRoutes     = require('./routes/authRoutes');
 const searchRoutes   = require('./routes/searchRoutes');
 const playlistRoutes = require('./routes/playlistRoutes');
+const profileRoutes  = require('./routes/profileRoutes');
 
 connectDB();
 
@@ -50,12 +51,75 @@ app.get('/test-email', async (req, res) => {
 app.use('/api/auth',      authRoutes);
 app.use('/api/search',    searchRoutes);
 app.use('/api/playlists', playlistRoutes);
+app.use('/api/profile',   profileRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`VStream server running on port ${PORT}`);
   startKeepAlive();
 });
+
+base/client/src/pages/Login.js
+
+
+// const dotenv = require('dotenv');
+// dotenv.config();
+
+// const express    = require('express');
+// const cors       = require('cors');
+// const connectDB  = require('./config/db');
+// const { startKeepAlive } = require('./keepAlive');
+
+// const authRoutes     = require('./routes/authRoutes');
+// const searchRoutes   = require('./routes/searchRoutes');
+// const playlistRoutes = require('./routes/playlistRoutes');
+
+// connectDB();
+
+// const app = express();
+// app.use(cors({ origin: '*' }));
+// app.use(express.json());
+
+// app.get('/health', (req, res) => res.json({ status: 'ok', app: 'VStream' }));
+
+// app.get('/test-email', async (req, res) => {
+//   try {
+//     const axios = require('axios');
+//     // Test Brevo HTTP API by sending a real test email
+//     await axios.post('https://api.brevo.com/v3/smtp/email', {
+//       sender: { name: 'VStream', email: process.env.EMAIL_USER },
+//       to: [{ email: process.env.EMAIL_USER }],
+//       subject: 'VStream Email Test',
+//       htmlContent: '<h1>Email working ✅</h1>'
+//     }, {
+//       headers: {
+//         'api-key': process.env.BREVO_API_KEY,
+//         'Content-Type': 'application/json'
+//       }
+//     });
+//     res.json({
+//       status: 'Brevo HTTP API connected ✅',
+//       user: process.env.EMAIL_USER,
+//       apiKeyLength: process.env.BREVO_API_KEY?.length
+//     });
+//   } catch (err) {
+//     res.json({
+//       status: 'Brevo FAILED ❌',
+//       error: err.response?.data?.message || err.message,
+//       apiKeyLength: process.env.BREVO_API_KEY?.length
+//     });
+//   }
+// });
+
+// app.use('/api/auth',      authRoutes);
+// app.use('/api/search',    searchRoutes);
+// app.use('/api/playlists', playlistRoutes);
+
+// const PORT = process.env.PORT || 5000;
+// app.listen(PORT, () => {
+//   console.log(`VStream server running on port ${PORT}`);
+//   startKeepAlive();
+// });
 
 
 //httpapi

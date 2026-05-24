@@ -20,7 +20,7 @@ const Navbar = () => {
         {/* Logo — same as original */}
         <Link to="/" style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '1.5rem', marginLeft: 0, color: 'white', textDecoration: 'none', fontWeight: 700 }}>
           <Music color="#1db954" size={32} />
-          <span>Vstream</span>
+          <span>VStream</span>
         </Link>
 
         {/* Desktop links — exactly like original */}
@@ -32,9 +32,9 @@ const Navbar = () => {
                 <Library size={18} style={{ verticalAlign: 'middle', marginRight: '4px' }} />
                 Library
               </Link>
-              <span style={{ marginLeft: '20px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <Link to="/profile" style={{ marginLeft: '20px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '4px' }}>
                 <UserIcon size={18} style={{ verticalAlign: 'middle' }} /> {user.username}
-              </span>
+              </Link>
               <button
                 onClick={handleLogout}
                 style={{ background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', marginLeft: '20px' }}
@@ -67,9 +67,9 @@ const Navbar = () => {
             <Link to="/library" onClick={() => setMenuOpen(false)}>
               <Library size={18} /> Library
             </Link>
-            <div style={{ padding: '12px 16px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600 }}>
+            <Link to="/profile" onClick={() => setMenuOpen(false)} style={{ padding: '12px 16px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600, textDecoration: 'none' }}>
               <UserIcon size={18} /> {user.username}
-            </div>
+            </Link>
             <button onClick={handleLogout} style={{
               background: 'none', border: 'none', cursor: 'pointer',
               color: '#b3b3b3', padding: '12px 16px',
@@ -91,6 +91,104 @@ const Navbar = () => {
 };
 
 export default Navbar;
+
+
+//profile edit and opt focus login signup server index profilerout profilepage.js navbar
+
+
+// import React, { useContext, useState } from 'react';
+// import { Link, useNavigate } from 'react-router-dom';
+// import { AuthContext } from '../context/AuthContext';
+// import { Music, LogOut, User as UserIcon, Library, Menu, X } from 'lucide-react';
+
+// const Navbar = () => {
+//   const { user, logout } = useContext(AuthContext);
+//   const navigate = useNavigate();
+//   const [menuOpen, setMenuOpen] = useState(false);
+
+//   const handleLogout = () => {
+//     logout();
+//     navigate('/login');
+//     setMenuOpen(false);
+//   };
+
+//   return (
+//     <>
+//       <nav className="nav">
+//         {/* Logo — same as original */}
+//         <Link to="/" style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '1.5rem', marginLeft: 0, color: 'white', textDecoration: 'none', fontWeight: 700 }}>
+//           <Music color="#1db954" size={32} />
+//           <span>Vstream</span>
+//         </Link>
+
+//         {/* Desktop links — exactly like original */}
+//         <div className="nav-links">
+//           <Link to="/">Search</Link>
+//           {user ? (
+//             <>
+//               <Link to="/library">
+//                 <Library size={18} style={{ verticalAlign: 'middle', marginRight: '4px' }} />
+//                 Library
+//               </Link>
+//               <span style={{ marginLeft: '20px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '4px' }}>
+//                 <UserIcon size={18} style={{ verticalAlign: 'middle' }} /> {user.username}
+//               </span>
+//               <button
+//                 onClick={handleLogout}
+//                 style={{ background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', marginLeft: '20px' }}
+//               >
+//                 <LogOut size={18} />
+//               </button>
+//             </>
+//           ) : (
+//             <>
+//               <Link to="/login">Login</Link>
+//               <Link to="/signup" className="btn-primary" style={{ marginLeft: '8px' }}>Sign Up</Link>
+//             </>
+//           )}
+//         </div>
+
+//         {/* Hamburger — mobile only */}
+//         <button
+//           className="nav-hamburger"
+//           onClick={() => setMenuOpen(prev => !prev)}
+//         >
+//           {menuOpen ? <X size={24} /> : <Menu size={24} />}
+//         </button>
+//       </nav>
+
+//       {/* Mobile menu */}
+//       <div className={`nav-mobile-menu ${menuOpen ? 'open' : ''}`}>
+//         <Link to="/" onClick={() => setMenuOpen(false)}>Search</Link>
+//         {user ? (
+//           <>
+//             <Link to="/library" onClick={() => setMenuOpen(false)}>
+//               <Library size={18} /> Library
+//             </Link>
+//             <div style={{ padding: '12px 16px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600 }}>
+//               <UserIcon size={18} /> {user.username}
+//             </div>
+//             <button onClick={handleLogout} style={{
+//               background: 'none', border: 'none', cursor: 'pointer',
+//               color: '#b3b3b3', padding: '12px 16px',
+//               display: 'flex', alignItems: 'center', gap: '8px',
+//               fontWeight: 600, fontSize: '1rem', width: '100%'
+//             }}>
+//               <LogOut size={18} /> Logout
+//             </button>
+//           </>
+//         ) : (
+//           <>
+//             <Link to="/login" onClick={() => setMenuOpen(false)}>Login</Link>
+//             <Link to="/signup" onClick={() => setMenuOpen(false)} style={{ color: '#1db954', fontWeight: 700 }}>Sign Up</Link>
+//           </>
+//         )}
+//       </div>
+//     </>
+//   );
+// };
+
+// export default Navbar;
 
 
 //old nav app and nav
