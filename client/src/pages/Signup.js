@@ -37,7 +37,7 @@ const Signup = () => {
   }, [method]);
 
   
-  const hiddenInputRef = useRef(null);
+  
   const handleOtpInput = (e) => {
     const value = e.target.value.replace(/\D/g, '').slice(0, 6);
     const arr = value.split('');
