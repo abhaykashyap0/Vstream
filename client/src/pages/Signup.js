@@ -10,13 +10,13 @@ const API = process.env.REACT_APP_API_URL || '';
 
 const Signup = () => {
   const [method, setMethod]         = useState('email');
-  const [step, setStep]             = useState(1); // 1=form, 2=otp, 3=username(phone new user)
+  const [step, setStep]             = useState(1); 
   const [formData, setFormData]     = useState({ username: '', email: '', phone: '', password: '' });
   const [otp, setOtp]               = useState(['','','','','','']);
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [success, setSuccess]       = useState('');
-  const [confirmResult, setConfirmResult] = useState(null); // Firebase confirmation
+  const [confirmResult, setConfirmResult] = useState(null); 
   const [firebaseToken, setFirebaseToken] = useState('');
   const [phoneForNew, setPhoneForNew]     = useState('');
   const otpRefs = useRef([]);
@@ -27,7 +27,7 @@ const Signup = () => {
 
   const reset = () => { setStep(1); setOtp(['','','','','','']); setError(''); setSuccess(''); };
 
-  // Setup invisible reCAPTCHA for Firebase
+ 
   useEffect(() => {
     if (method === 'phone' && !recaptchaRef.current) {
       recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', {
@@ -36,7 +36,7 @@ const Signup = () => {
     }
   }, [method]);
 
-  // Single hidden input approach — no per-box clicking needed
+  
   const hiddenInputRef = useRef(null);
   const handleOtpInput = (e) => {
     const value = e.target.value.replace(/\D/g, '').slice(0, 6);
@@ -46,7 +46,7 @@ const Signup = () => {
     setOtp(newOtp);
   };
 
-  // ── Email signup ────────────────────────────────────────────────
+  
   const handleEmailSendOtp = async (e) => {
     e.preventDefault();
     setLoading(true); setError(''); setSuccess('');
@@ -79,7 +79,7 @@ const Signup = () => {
     } finally { setLoading(false); }
   };
 
-  // ── Phone signup via Firebase ────────────────────────────────────
+  
   const handlePhoneSendOtp = async (e) => {
     e.preventDefault();
     setLoading(true); setError('');
@@ -94,7 +94,7 @@ const Signup = () => {
     } catch (err) {
       console.error('Firebase send OTP error:', err);
       setError('Failed to send OTP. Check phone number format (+91XXXXXXXXXX)');
-      recaptchaRef.current = null; // reset recaptcha on error
+      recaptchaRef.current = null; 
     } finally { setLoading(false); }
   };
 
@@ -107,14 +107,14 @@ const Signup = () => {
       const token  = await result.user.getIdToken();
       setFirebaseToken(token);
 
-      // Send to backend
+      
       const { data } = await axios.post(`${API}/api/auth/phone/firebase-verify`, {
         firebaseToken: token,
         username: formData.username
       });
 
       if (data.needsUsername) {
-        // Shouldn't happen since we collect username upfront, but handle anyway
+        
         setPhoneForNew(data.phone);
         setStep(3);
       } else {
@@ -127,7 +127,7 @@ const Signup = () => {
     } finally { setLoading(false); }
   };
 
-  // ── Step 3: submit username for new phone user ──────────────────
+  
   const handleUsernameSubmit = async (e) => {
     e.preventDefault();
     setLoading(true); setError('');
