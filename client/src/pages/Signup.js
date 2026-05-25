@@ -141,6 +141,27 @@ const Signup = () => {
     } finally { setLoading(false); }
   };
 
+  const handleOtpChange = (index, e) => {
+    const value = e.target.value;
+    if (isNaN(value)) return;
+
+    const newOtp = [...otp];
+    // Take only the last character entered
+    newOtp[index] = value.substring(value.length - 1);
+    setOtp(newOtp);
+
+    // Move to next box if value is entered
+    if (value && index < 5) {
+      otpRefs.current[index + 1].focus();
+    }
+  };
+
+  const handleOtpKeyDown = (index, e) => {
+    // Move to previous box on backspace if current box is empty
+    if (e.key === 'Backspace' && !otp[index] && index > 0) {
+      otpRefs.current[index - 1].focus();
+    }
+  };
   const OtpBoxes = ({ onVerify }) => (
     <>
       <div style={{ display: 'flex', gap: 'clamp(6px, 2vw, 10px)', justifyContent: 'center', marginBottom: '24px' }}>
