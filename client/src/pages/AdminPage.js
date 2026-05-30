@@ -62,8 +62,7 @@ const LoginGate = ({ onAuth }) => {
     e.preventDefault();
     try {
       const res = await axios.get(`${API}/api/admin/dashboard`, {
-        headers: { 'x-admin-key': key },
-        params: { limit: 1 }
+        params: { key, limit: 1 }
       });
       if (res.data) { onAuth(key); }
     } catch {
@@ -103,12 +102,12 @@ const AdminDashboard = ({ adminKey }) => {
   const [selectedUser, setSelectedUser] = useState(null);
   const [userDetail, setUserDetail]     = useState(null);
 
-  const headers = { 'x-admin-key': adminKey };
+  // key passed as query param to avoid CORS preflight on custom headers
 
   const fetchDashboard = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await axios.get(`${API}/api/admin/dashboard`, { headers, params: { limit: 100 } });
+      const res = await axios.get(`${API}/api/admin/dashboard`, { params: { key: adminKey, limit: 100 } });
       setData(res.data);
     } catch (err) {
       console.error(err);
@@ -117,7 +116,7 @@ const AdminDashboard = ({ adminKey }) => {
 
   const fetchUserDetail = async (userId) => {
     setSelectedUser(userId);
-    const res = await axios.get(`${API}/api/admin/user/${userId}`, { headers });
+    const res = await axios.get(`${API}/api/admin/user/${userId}`, { params: { key: adminKey } });
     setUserDetail(res.data);
   };
 

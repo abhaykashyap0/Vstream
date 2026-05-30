@@ -7,7 +7,10 @@ const UserSession = require('../models/UserSession');
 // Only you know this key. Set ADMIN_SECRET in your .env file.
 const adminAuth = (req, res, next) => {
   const key = req.headers['x-admin-key'] || req.query.key;
-  if (!key || key !== process.env.ADMIN_SECRET) {
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const received = (key || '').trim();
+  
+  if (!received || received !== expected) {
     return res.status(403).json({ message: 'Access denied' });
   }
   next();
