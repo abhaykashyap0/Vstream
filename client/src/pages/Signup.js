@@ -73,17 +73,19 @@ const Signup = () => {
     e?.preventDefault();
     setLoading(true); setError('');
     try {
-      // Always recreate recaptcha fresh — required for WebView/APK compatibility
+      // Clear old recaptcha
       if (recaptchaRef.current) {
         try { recaptchaRef.current.clear(); } catch {}
         recaptchaRef.current = null;
       }
+      // Wipe the container div so reCAPTCHA can render fresh
+      const container = document.getElementById('recaptcha-container-signup');
+      if (container) container.innerHTML = '';
+
       recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', {
         size: 'invisible',
         callback: () => {},
-        'expired-callback': () => {
-          recaptchaRef.current = null;
-        }
+        'expired-callback': () => { recaptchaRef.current = null; }
       });
       await recaptchaRef.current.render();
       const result = await signInWithPhoneNumber(auth, formData.phone, recaptchaRef.current);
@@ -96,6 +98,8 @@ const Signup = () => {
         try { recaptchaRef.current.clear(); } catch {}
         recaptchaRef.current = null;
       }
+      const container = document.getElementById('recaptcha-container-signup');
+      if (container) container.innerHTML = '';
       setError(err?.message || 'Failed to send OTP. Check phone number format (+91XXXXXXXXXX)');
     } finally { setLoading(false); }
   };
