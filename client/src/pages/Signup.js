@@ -10,24 +10,23 @@ const API = process.env.REACT_APP_API_URL || '';
 
 const Signup = () => {
   const [method, setMethod]         = useState('email');
-  const [step, setStep]             = useState(1); 
+  const [step, setStep]             = useState(1);
   const [formData, setFormData]     = useState({ username: '', email: '', phone: '', password: '' });
   const [otp, setOtp]               = useState(['','','','','','']);
   const [loading, setLoading]       = useState(false);
   const [error, setError]           = useState('');
   const [success, setSuccess]       = useState('');
-  const [confirmResult, setConfirmResult] = useState(null); 
+  const [confirmResult, setConfirmResult] = useState(null);
   const [firebaseToken, setFirebaseToken] = useState('');
   const [phoneForNew, setPhoneForNew]     = useState('');
-  const otpRefs = useRef([]);
+  const otpRefs        = useRef([]);
   const hiddenInputRef = useRef(null);
-  const recaptchaRef = useRef(null);
-  const { login } = useContext(AuthContext);
-  const navigate  = useNavigate();
+  const recaptchaRef   = useRef(null);
+  const { login }      = useContext(AuthContext);
+  const navigate       = useNavigate();
 
   const reset = () => { setStep(1); setOtp(['','','','','','']); setError(''); setSuccess(''); };
 
- 
   useEffect(() => {
     if (method === 'phone' && !recaptchaRef.current) {
       recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', {
@@ -36,8 +35,6 @@ const Signup = () => {
     }
   }, [method]);
 
-  
-  
   const handleOtpInput = (e) => {
     const value = e.target.value.replace(/\D/g, '').slice(0, 6);
     const arr = value.split('');
@@ -46,7 +43,6 @@ const Signup = () => {
     setOtp(newOtp);
   };
 
-  
   const handleEmailSendOtp = async (e) => {
     e.preventDefault();
     setLoading(true); setError(''); setSuccess('');
@@ -79,7 +75,6 @@ const Signup = () => {
     } finally { setLoading(false); }
   };
 
-  
   const handlePhoneSendOtp = async (e) => {
     e.preventDefault();
     setLoading(true); setError('');
@@ -94,7 +89,7 @@ const Signup = () => {
     } catch (err) {
       console.error('Firebase send OTP error:', err);
       setError('Failed to send OTP. Check phone number format (+91XXXXXXXXXX)');
-      recaptchaRef.current = null; 
+      recaptchaRef.current = null;
     } finally { setLoading(false); }
   };
 
@@ -107,14 +102,12 @@ const Signup = () => {
       const token  = await result.user.getIdToken();
       setFirebaseToken(token);
 
-      
       const { data } = await axios.post(`${API}/api/auth/phone/firebase-verify`, {
         firebaseToken: token,
         username: formData.username
       });
 
       if (data.needsUsername) {
-        
         setPhoneForNew(data.phone);
         setStep(3);
       } else {
@@ -127,7 +120,6 @@ const Signup = () => {
     } finally { setLoading(false); }
   };
 
-  
   const handleUsernameSubmit = async (e) => {
     e.preventDefault();
     setLoading(true); setError('');
@@ -144,24 +136,20 @@ const Signup = () => {
   const handleOtpChange = (index, e) => {
     const value = e.target.value;
     if (isNaN(value)) return;
-
     const newOtp = [...otp];
-    // Take only the last character entered
     newOtp[index] = value.substring(value.length - 1);
     setOtp(newOtp);
-
-    // Move to next box if value is entered
     if (value && index < 5) {
       otpRefs.current[index + 1].focus();
     }
   };
 
   const handleOtpKeyDown = (index, e) => {
-    // Move to previous box on backspace if current box is empty
     if (e.key === 'Backspace' && !otp[index] && index > 0) {
       otpRefs.current[index - 1].focus();
     }
   };
+
   const OtpBoxes = ({ onVerify }) => (
     <>
       <div style={{ display: 'flex', gap: 'clamp(6px, 2vw, 10px)', justifyContent: 'center', marginBottom: '24px' }}>
@@ -206,7 +194,6 @@ const Signup = () => {
         <p style={{ color: '#b3b3b3', marginTop: '6px', fontSize: '0.9rem' }}>Join VStream for free</p>
       </div>
 
-      {/* Method tabs */}
       {step === 1 && (
         <div style={{ display: 'flex', background: '#121212', borderRadius: '8px', padding: '4px', marginBottom: '20px' }}>
           {['email','phone'].map(m => (
@@ -228,7 +215,7 @@ const Signup = () => {
       {error && <div style={{ background: '#2a1a1a', border: '1px solid #ff4444', borderRadius: '8px', padding: '10px 14px', color: '#ff6666', fontSize: '0.85rem', marginBottom: '14px' }}>{error}</div>}
       {success && <div style={{ background: '#1a2a1a', border: '1px solid #1db954', borderRadius: '8px', padding: '10px 14px', color: '#1db954', fontSize: '0.85rem', marginBottom: '14px' }}>{success}</div>}
 
-      {/* ── STEP 1 ── */}
+      {/* ── STEP 1 EMAIL ── */}
       {step === 1 && method === 'email' && (
         <form onSubmit={handleEmailSendOtp}>
           <input type="text" placeholder="Username" required value={formData.username} onChange={e => setFormData({...formData, username: e.target.value})} />
@@ -240,6 +227,7 @@ const Signup = () => {
         </form>
       )}
 
+      {/* ── STEP 1 PHONE ── */}
       {step === 1 && method === 'phone' && (
         <form onSubmit={handlePhoneSendOtp}>
           <input type="text" placeholder="Username" required value={formData.username} onChange={e => setFormData({...formData, username: e.target.value})} />
@@ -252,7 +240,7 @@ const Signup = () => {
         </form>
       )}
 
-      {/* ── STEP 2 — OTP ── */}
+      {/* ── STEP 2 OTP ── */}
       {step === 2 && (() => { setTimeout(() => hiddenInputRef.current?.focus(), 100); return null; })()}
       {step === 2 && (
         <div>
@@ -271,7 +259,7 @@ const Signup = () => {
         </div>
       )}
 
-      {/* ── STEP 3 — Username for phone user ── */}
+      {/* ── STEP 3 Username for phone user ── */}
       {step === 3 && (
         <form onSubmit={handleUsernameSubmit}>
           <p style={{ color: '#b3b3b3', marginBottom: '16px', fontSize: '0.9rem' }}>Phone verified! Choose a username:</p>
@@ -291,6 +279,301 @@ const Signup = () => {
 };
 
 export default Signup;
+
+
+// import React, { useState, useContext, useRef, useEffect } from 'react';
+// import { useNavigate, Link } from 'react-router-dom';
+// import axios from 'axios';
+// import { RecaptchaVerifier, signInWithPhoneNumber } from 'firebase/auth';
+// import { auth } from '../firebase';
+// import { AuthContext } from '../context/AuthContext';
+// import { Music, Mail, Phone, ArrowLeft } from 'lucide-react';
+
+// const API = process.env.REACT_APP_API_URL || '';
+
+// const Signup = () => {
+//   const [method, setMethod]         = useState('email');
+//   const [step, setStep]             = useState(1); 
+//   const [formData, setFormData]     = useState({ username: '', email: '', phone: '', password: '' });
+//   const [otp, setOtp]               = useState(['','','','','','']);
+//   const [loading, setLoading]       = useState(false);
+//   const [error, setError]           = useState('');
+//   const [success, setSuccess]       = useState('');
+//   const [confirmResult, setConfirmResult] = useState(null); 
+//   const [firebaseToken, setFirebaseToken] = useState('');
+//   const [phoneForNew, setPhoneForNew]     = useState('');
+//   const otpRefs = useRef([]);
+//   const hiddenInputRef = useRef(null);
+//   const recaptchaRef = useRef(null);
+//   const { login } = useContext(AuthContext);
+//   const navigate  = useNavigate();
+
+//   const reset = () => { setStep(1); setOtp(['','','','','','']); setError(''); setSuccess(''); };
+
+ 
+//   useEffect(() => {
+//     if (method === 'phone' && !recaptchaRef.current) {
+//       recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', {
+//         size: 'invisible'
+//       });
+//     }
+//   }, [method]);
+
+  
+  
+//   const handleOtpInput = (e) => {
+//     const value = e.target.value.replace(/\D/g, '').slice(0, 6);
+//     const arr = value.split('');
+//     const newOtp = ['','','','','',''];
+//     arr.forEach((d, i) => { newOtp[i] = d; });
+//     setOtp(newOtp);
+//   };
+
+  
+//   const handleEmailSendOtp = async (e) => {
+//     e.preventDefault();
+//     setLoading(true); setError(''); setSuccess('');
+//     try {
+//       const { data } = await axios.post(`${API}/api/auth/signup/send-otp`, {
+//         username: formData.username,
+//         email: formData.email,
+//         password: formData.password
+//       });
+//       setSuccess(data.message);
+//       setStep(2);
+//     } catch (err) {
+//       setError(err.response?.data?.message || 'Failed to send OTP');
+//     } finally { setLoading(false); }
+//   };
+
+//   const handleEmailVerifyOtp = async () => {
+//     const otpString = otp.join('');
+//     if (otpString.length !== 6) return setError('Enter complete 6-digit OTP');
+//     setLoading(true); setError('');
+//     try {
+//       const { data } = await axios.post(`${API}/api/auth/signup/verify-otp`, {
+//         email: formData.email, otp: otpString
+//       });
+//       login(data); navigate('/');
+//     } catch (err) {
+//       setError(err.response?.data?.message || 'Invalid OTP');
+//       setOtp(['','','','','','']);
+//       otpRefs.current[0]?.focus();
+//     } finally { setLoading(false); }
+//   };
+
+  
+//   const handlePhoneSendOtp = async (e) => {
+//     e.preventDefault();
+//     setLoading(true); setError('');
+//     try {
+//       if (!recaptchaRef.current) {
+//         recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', { size: 'invisible' });
+//       }
+//       const result = await signInWithPhoneNumber(auth, formData.phone, recaptchaRef.current);
+//       setConfirmResult(result);
+//       setSuccess(`OTP sent to ${formData.phone}`);
+//       setStep(2);
+//     } catch (err) {
+//       console.error('Firebase send OTP error:', err);
+//       setError('Failed to send OTP. Check phone number format (+91XXXXXXXXXX)');
+//       recaptchaRef.current = null; 
+//     } finally { setLoading(false); }
+//   };
+
+//   const handlePhoneVerifyOtp = async () => {
+//     const otpString = otp.join('');
+//     if (otpString.length !== 6) return setError('Enter complete 6-digit OTP');
+//     setLoading(true); setError('');
+//     try {
+//       const result = await confirmResult.confirm(otpString);
+//       const token  = await result.user.getIdToken();
+//       setFirebaseToken(token);
+
+      
+//       const { data } = await axios.post(`${API}/api/auth/phone/firebase-verify`, {
+//         firebaseToken: token,
+//         username: formData.username
+//       });
+
+//       if (data.needsUsername) {
+        
+//         setPhoneForNew(data.phone);
+//         setStep(3);
+//       } else {
+//         login(data); navigate('/');
+//       }
+//     } catch (err) {
+//       setError(err.response?.data?.message || 'Invalid OTP');
+//       setOtp(['','','','','','']);
+//       otpRefs.current[0]?.focus();
+//     } finally { setLoading(false); }
+//   };
+
+  
+//   const handleUsernameSubmit = async (e) => {
+//     e.preventDefault();
+//     setLoading(true); setError('');
+//     try {
+//       const { data } = await axios.post(`${API}/api/auth/phone/firebase-verify`, {
+//         firebaseToken, username: formData.username
+//       });
+//       login(data); navigate('/');
+//     } catch (err) {
+//       setError(err.response?.data?.message || 'Failed to create account');
+//     } finally { setLoading(false); }
+//   };
+
+//   const handleOtpChange = (index, e) => {
+//     const value = e.target.value;
+//     if (isNaN(value)) return;
+
+//     const newOtp = [...otp];
+//     // Take only the last character entered
+//     newOtp[index] = value.substring(value.length - 1);
+//     setOtp(newOtp);
+
+//     // Move to next box if value is entered
+//     if (value && index < 5) {
+//       otpRefs.current[index + 1].focus();
+//     }
+//   };
+
+//   const handleOtpKeyDown = (index, e) => {
+//     // Move to previous box on backspace if current box is empty
+//     if (e.key === 'Backspace' && !otp[index] && index > 0) {
+//       otpRefs.current[index - 1].focus();
+//     }
+//   };
+//   const OtpBoxes = ({ onVerify }) => (
+//     <>
+//       <div style={{ display: 'flex', gap: 'clamp(6px, 2vw, 10px)', justifyContent: 'center', marginBottom: '24px' }}>
+//         {otp.map((digit, i) => (
+//           <input key={i} ref={el => otpRefs.current[i] = el}
+//             type="tel" inputMode="numeric" maxLength={2} value={digit}
+//             onChange={e => handleOtpChange(i, e)}
+//             onKeyDown={e => handleOtpKeyDown(i, e)}
+//             onFocus={e => e.target.select()}
+//             onPaste={e => {
+//               e.preventDefault();
+//               const text = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6);
+//               const newOtp = ['','','','','',''];
+//               text.split('').forEach((d, idx) => { newOtp[idx] = d; });
+//               setOtp(newOtp);
+//               otpRefs.current[Math.min(text.length, 5)]?.focus();
+//             }}
+//             onClick={e => e.target.select()}
+//             style={{
+//               width: '42px', height: '52px', textAlign: 'center',
+//               fontSize: '1.4rem', fontWeight: 700,
+//               background: digit ? 'rgba(29,185,84,0.15)' : '#1a1a1a',
+//               border: `2px solid ${digit ? '#1db954' : '#444'}`,
+//               borderRadius: '10px', color: 'white', outline: 'none',
+//               transition: 'all 0.15s', caretColor: '#1db954',
+//               WebkitUserSelect: 'none'
+//             }} />
+//         ))}
+//       </div>
+//       <button onClick={onVerify} className="btn-primary" disabled={loading}
+//         style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//         {loading ? 'Verifying...' : 'Verify & Create Account'}
+//       </button>
+//     </>
+//   );
+
+//   return (
+//     <div className="auth-form">
+//       <div style={{ textAlign: 'center', marginBottom: '24px' }}>
+//         <Music color="#1db954" size={36} style={{ marginBottom: '10px' }} />
+//         <h2 style={{ margin: 0 }}>Create account</h2>
+//         <p style={{ color: '#b3b3b3', marginTop: '6px', fontSize: '0.9rem' }}>Join VStream for free</p>
+//       </div>
+
+//       {/* Method tabs */}
+//       {step === 1 && (
+//         <div style={{ display: 'flex', background: '#121212', borderRadius: '8px', padding: '4px', marginBottom: '20px' }}>
+//           {['email','phone'].map(m => (
+//             <button key={m} onClick={() => { setMethod(m); reset(); }}
+//               style={{
+//                 flex: 1, padding: '9px', border: 'none', borderRadius: '6px', cursor: 'pointer',
+//                 fontWeight: 600, fontSize: '0.88rem', transition: 'all 0.2s',
+//                 background: method === m ? '#1db954' : 'transparent',
+//                 color: method === m ? 'white' : '#b3b3b3',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px'
+//               }}>
+//               {m === 'email' ? <Mail size={15}/> : <Phone size={15}/>}
+//               {m === 'email' ? 'Email' : 'Phone'}
+//             </button>
+//           ))}
+//         </div>
+//       )}
+
+//       {error && <div style={{ background: '#2a1a1a', border: '1px solid #ff4444', borderRadius: '8px', padding: '10px 14px', color: '#ff6666', fontSize: '0.85rem', marginBottom: '14px' }}>{error}</div>}
+//       {success && <div style={{ background: '#1a2a1a', border: '1px solid #1db954', borderRadius: '8px', padding: '10px 14px', color: '#1db954', fontSize: '0.85rem', marginBottom: '14px' }}>{success}</div>}
+
+//       {/* ── STEP 1 ── */}
+//       {step === 1 && method === 'email' && (
+//         <form onSubmit={handleEmailSendOtp}>
+//           <input type="text" placeholder="Username" required value={formData.username} onChange={e => setFormData({...formData, username: e.target.value})} />
+//           <input type="email" placeholder="Email address" required value={formData.email} onChange={e => setFormData({...formData, email: e.target.value})} />
+//           <input type="password" placeholder="Password (min 6 chars)" required minLength={6} value={formData.password} onChange={e => setFormData({...formData, password: e.target.value})} />
+//           <button type="submit" className="btn-primary" disabled={loading} style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//             {loading ? 'Sending OTP...' : 'Send OTP via Email'}
+//           </button>
+//         </form>
+//       )}
+
+//       {step === 1 && method === 'phone' && (
+//         <form onSubmit={handlePhoneSendOtp}>
+//           <input type="text" placeholder="Username" required value={formData.username} onChange={e => setFormData({...formData, username: e.target.value})} />
+//           <input type="tel" placeholder="+91 9876543210" required value={formData.phone} onChange={e => setFormData({...formData, phone: e.target.value})} />
+//           <p style={{ color: '#666', fontSize: '0.78rem', marginTop: '-8px', marginBottom: '14px' }}>Include country code e.g. +91 for India</p>
+//           <div id="recaptcha-container-signup"></div>
+//           <button type="submit" className="btn-primary" disabled={loading} style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//             {loading ? 'Sending OTP...' : 'Send OTP via SMS'}
+//           </button>
+//         </form>
+//       )}
+
+//       {/* ── STEP 2 — OTP ── */}
+//       {step === 2 && (() => { setTimeout(() => hiddenInputRef.current?.focus(), 100); return null; })()}
+//       {step === 2 && (
+//         <div>
+//           <button onClick={reset} style={{ background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '20px', padding: 0 }}>
+//             <ArrowLeft size={16} /> Back
+//           </button>
+//           <p style={{ color: '#b3b3b3', fontSize: '0.9rem', marginBottom: '20px', textAlign: 'center' }}>
+//             Enter the 6-digit code sent to<br />
+//             <strong style={{ color: 'white' }}>{method === 'email' ? formData.email : formData.phone}</strong>
+//           </p>
+//           <OtpBoxes onVerify={method === 'email' ? handleEmailVerifyOtp : handlePhoneVerifyOtp} />
+//           <button onClick={method === 'email' ? handleEmailSendOtp : handlePhoneSendOtp}
+//             style={{ width: '100%', background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', marginTop: '12px', fontSize: '0.85rem' }}>
+//             Didn't receive it? <span style={{ color: '#1db954' }}>Resend OTP</span>
+//           </button>
+//         </div>
+//       )}
+
+//       {/* ── STEP 3 — Username for phone user ── */}
+//       {step === 3 && (
+//         <form onSubmit={handleUsernameSubmit}>
+//           <p style={{ color: '#b3b3b3', marginBottom: '16px', fontSize: '0.9rem' }}>Phone verified! Choose a username:</p>
+//           <input type="text" placeholder="Username" required value={formData.username} onChange={e => setFormData({...formData, username: e.target.value})} />
+//           <button type="submit" className="btn-primary" disabled={loading} style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//             {loading ? 'Creating...' : 'Create Account'}
+//           </button>
+//         </form>
+//       )}
+
+//       <p style={{ marginTop: '20px', textAlign: 'center', color: '#b3b3b3', fontSize: '0.9rem' }}>
+//         Already have an account?{' '}
+//         <Link to="/login" style={{ color: '#1db954', fontWeight: 600 }}>Log in</Link>
+//       </p>
+//     </div>
+//   );
+// };
+
+// export default Signup;
 
 // import React, { useState, useContext, useRef, useEffect } from 'react';
 // import { useNavigate, Link } from 'react-router-dom';
