@@ -1,164 +1,128 @@
-const express = require('express');
-const router  = express.Router();
-const jwt     = require('jsonwebtoken');
-const axios   = require('axios');
-const admin   = require('firebase-admin');
-const User    = require('../models/User');
+const express  = require('express');
+const router   = express.Router();
+const User     = require('../models/User');
+const UserSession = require('../models/UserSession');
 
-const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
-const generateOTP   = () => Math.floor(100000 + Math.random() * 900000).toString();
-
-const otpStore = {};
-const storeOTP = (key, otp, userData = {}) => {
-  otpStore[key] = { otp, expiresAt: Date.now() + 10 * 60 * 1000, userData };
-};
-const verifyOTPFromStore = (key, otp) => {
-  const record = otpStore[key];
-  if (!record) return { valid: false, message: 'OTP not found. Please request again.' };
-  if (Date.now() > record.expiresAt) { delete otpStore[key]; return { valid: false, message: 'OTP expired. Please request again.' }; }
-  if (record.otp !== otp) return { valid: false, message: 'Invalid OTP.' };
-  const userData = record.userData;
-  delete otpStore[key];
-  return { valid: true, userData };
+// ── Admin secret check middleware ──────────────────────────────────────────
+// Only you know this key. Set ADMIN_SECRET in your .env file.
+const adminAuth = (req, res, next) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  const expected = (process.env.ADMIN_SECRET || '').trim();
+  const received = (key || '').trim();
+  console.log('[admin] received:', JSON.stringify(received), 'expected:', JSON.stringify(expected), 'match:', received === expected);
+  if (!received || received !== expected) {
+    return res.status(403).json({ message: 'Access denied' });
+  }
+  next();
 };
 
-let firebaseInitialized = false;
-const initFirebase = () => {
-  if (firebaseInitialized) return;
+// ── POST /api/admin/session/start ──────────────────────────────────────────
+// Called from frontend when a user logs in (record session start)
+router.post('/session/start', async (req, res) => {
   try {
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId:   process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
-      })
+    const { userId, username, email, ipAddress, userAgent } = req.body;
+    const session = await UserSession.create({ userId, username, email, ipAddress, userAgent });
+    res.json({ sessionId: session._id });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── POST /api/admin/session/song ───────────────────────────────────────────
+// Called from frontend when a user plays a song
+router.post('/session/song', async (req, res) => {
+  try {
+    const { sessionId, songId, title, artist } = req.body;
+    if (!sessionId) return res.json({ ok: true }); // graceful no-op
+    await UserSession.findByIdAndUpdate(sessionId, {
+      $push: { songsPlayed: { songId, title, artist, playedAt: new Date() } }
     });
-    firebaseInitialized = true;
-  } catch (e) {
-    console.error('Firebase admin init failed:', e.message);
-  }
-};
-
-// ── Send OTP via Brevo HTTP API (not SMTP — works on Render free tier) ──
-const sendEmailOTP = async (email, otp, purpose = 'verify') => {
-  const response = await axios.post(
-    'https://api.brevo.com/v3/smtp/email',
-    {
-      sender:  { name: 'VStream', email: process.env.EMAIL_USER },
-      to:      [{ email }],
-      subject: purpose === 'login' ? 'Your VStream Login OTP' : 'Verify your VStream account',
-      htmlContent: `
-        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#1e1e1e;padding:32px;border-radius:12px;">
-          <h2 style="color:#1db954;">VStream 🎵</h2>
-          <p style="color:#b3b3b3;">${purpose === 'login' ? 'Your login code:' : 'Your verification code:'}</p>
-          <div style="background:#121212;border-radius:8px;padding:20px;text-align:center;margin:20px 0;">
-            <span style="font-size:2.5rem;font-weight:900;letter-spacing:12px;color:#1db954;">${otp}</span>
-          </div>
-          <p style="color:#666;font-size:0.85rem;">Expires in <strong style="color:#b3b3b3;">10 minutes</strong>. Do not share.</p>
-        </div>
-      `
-    },
-    {
-      headers: {
-        'api-key': process.env.BREVO_API_KEY,
-        'Content-Type': 'application/json'
-      }
-    }
-  );
-  return response.data;
-};
-
-router.post('/signup/send-otp', async (req, res) => {
-  const { username, email, password } = req.body;
-  try {
-    if (!username || !email || !password)
-      return res.status(400).json({ message: 'All fields are required' });
-    const exists = await User.findOne({ $or: [{ email }, { username }] });
-    if (exists) return res.status(400).json({ message: exists.email === email ? 'Email already registered' : 'Username already taken' });
-    const otp = generateOTP();
-    storeOTP(`signup:${email}`, otp, { username, email, password });
-    await sendEmailOTP(email, otp, 'verify');
-    res.json({ message: `OTP sent to ${email}` });
-  } catch (err) {
-    console.error('Signup OTP error:', err.response?.data || err.message);
-    res.status(500).json({ message: 'Failed to send OTP.', detail: err.response?.data?.message || err.message });
-  }
-});
-
-router.post('/signup/verify-otp', async (req, res) => {
-  const { email, otp } = req.body;
-  try {
-    const result = verifyOTPFromStore(`signup:${email}`, otp);
-    if (!result.valid) return res.status(400).json({ message: result.message });
-    const { username, password } = result.userData;
-    const user = await User.create({ username, email, password });
-    res.status(201).json({ _id: user._id, username: user.username, email: user.email, token: generateToken(user._id) });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+// ── POST /api/admin/session/end ────────────────────────────────────────────
+// Called from frontend on logout
+router.post('/session/end', async (req, res) => {
   try {
-    const user = await User.findOne({ email });
-    if (user && (await user.matchPassword(password))) {
-      res.json({ _id: user._id, username: user.username, email: user.email, token: generateToken(user._id) });
-    } else {
-      res.status(401).json({ message: 'Invalid email or password' });
-    }
+    const { sessionId } = req.body;
+    if (!sessionId) return res.json({ ok: true });
+    const session = await UserSession.findById(sessionId);
+    if (!session) return res.json({ ok: true });
+    const logoutAt   = new Date();
+    const durationMs = logoutAt - session.loginAt;
+    await UserSession.findByIdAndUpdate(sessionId, { logoutAt, durationMs });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-router.post('/login/send-otp', async (req, res) => {
-  const { email } = req.body;
+// ── GET /api/admin/dashboard ───────────────────────────────────────────────
+// Admin-only: get all user activity
+router.get('/dashboard', adminAuth, async (req, res) => {
   try {
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: 'No account found with this email' });
-    const otp = generateOTP();
-    storeOTP(`login:${email}`, otp);
-    await sendEmailOTP(email, otp, 'login');
-    res.json({ message: `OTP sent to ${email}` });
-  } catch (err) {
-    res.status(500).json({ message: 'Failed to send OTP' });
-  }
-});
+    const { page = 1, limit = 50, userId } = req.query;
+    const filter = userId ? { userId } : {};
 
-router.post('/login/verify-otp', async (req, res) => {
-  const { email, otp } = req.body;
-  try {
-    const result = verifyOTPFromStore(`login:${email}`, otp);
-    if (!result.valid) return res.status(400).json({ message: result.message });
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    res.json({ _id: user._id, username: user.username, email: user.email, token: generateToken(user._id) });
+    const sessions = await UserSession.find(filter)
+      .sort({ loginAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(Number(limit))
+      .populate('userId', 'username email createdAt');
+
+    const totalUsers  = await User.countDocuments();
+    const totalSessions = await UserSession.countDocuments();
+
+    // Active right now (no logoutAt)
+    const activeSessions = await UserSession.find({ logoutAt: null })
+      .populate('userId', 'username email');
+
+    // Most played songs across all sessions
+    const topSongs = await UserSession.aggregate([
+      { $unwind: '$songsPlayed' },
+      { $group: { _id: '$songsPlayed.title', artist: { $first: '$songsPlayed.artist' }, count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 }
+    ]);
+
+    // Per-user stats
+    const userStats = await UserSession.aggregate([
+      { $group: {
+        _id: '$userId',
+        username:      { $first: '$username' },
+        email:         { $first: '$email' },
+        totalSessions: { $sum: 1 },
+        totalDurationMs: { $sum: '$durationMs' },
+        totalSongsPlayed: { $sum: { $size: '$songsPlayed' } },
+        lastLogin: { $max: '$loginAt' }
+      }},
+      { $sort: { lastLogin: -1 } }
+    ]);
+
+    res.json({
+      summary: { totalUsers, totalSessions, activeNow: activeSessions.length },
+      activeSessions,
+      sessions,
+      userStats,
+      topSongs
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-router.post('/phone/firebase-verify', async (req, res) => {
-  const { firebaseToken, username } = req.body;
-  if (!firebaseToken) return res.status(400).json({ message: 'Firebase token required' });
+// ── GET /api/admin/user/:userId ────────────────────────────────────────────
+// Admin-only: get all sessions for a specific user
+router.get('/user/:userId', adminAuth, async (req, res) => {
   try {
-    initFirebase();
-    const decoded = await admin.auth().verifyIdToken(firebaseToken);
-    const phone   = decoded.phone_number;
-    if (!phone) return res.status(400).json({ message: 'Phone number not found in token' });
-    let user = await User.findOne({ phone });
-    if (user) return res.json({ _id: user._id, username: user.username, phone: user.phone, token: generateToken(user._id) });
-    if (!username) return res.status(200).json({ needsUsername: true, phone });
-    const usernameTaken = await User.findOne({ username });
-    if (usernameTaken) return res.status(400).json({ message: 'Username already taken' });
-    user = await User.create({ username, phone, password: `firebase_${phone}_${Date.now()}` });
-    res.status(201).json({ _id: user._id, username: user.username, phone: user.phone, token: generateToken(user._id) });
+    const sessions = await UserSession.find({ userId: req.params.userId }).sort({ loginAt: -1 });
+    const user     = await User.findById(req.params.userId).select('-password');
+    res.json({ user, sessions });
   } catch (err) {
-    console.error('Firebase verify error:', err.message);
-    if (err.code === 'auth/id-token-expired')
-      return res.status(401).json({ message: 'Session expired. Please try again.' });
-    res.status(500).json({ message: 'Verification failed. Try again.' });
+    res.status(500).json({ message: err.message });
   }
 });
 

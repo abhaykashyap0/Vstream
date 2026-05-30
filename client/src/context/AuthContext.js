@@ -7,10 +7,9 @@ export const AuthContext = createContext();
 const API = process.env.REACT_APP_API_URL || '';
 
 export const AuthProvider = ({ children }) => {
-  const [user, setUser]         = useState(null);
-  const [loading, setLoading]   = useState(true);
-  const [sessionId, setSessionId] = useState(() => localStorage.getItem('vstreamSessionId') || null);
-  const { resetPlayer } = useContext(MusicContext);
+  const [user, setUser]       = useState(null);
+  const [loading, setLoading] = useState(true);
+  const { resetPlayer }       = useContext(MusicContext);
 
   useEffect(() => {
     const storedUser = localStorage.getItem('musicUser');
@@ -22,7 +21,7 @@ export const AuthProvider = ({ children }) => {
     setUser(userData);
     localStorage.setItem('musicUser', JSON.stringify(userData));
 
-    // Record session start for admin tracking
+    // ✅ Start admin session tracking
     try {
       const res = await axios.post(`${API}/api/admin/session/start`, {
         userId:    userData._id || userData.id,
@@ -30,46 +29,31 @@ export const AuthProvider = ({ children }) => {
         email:     userData.email,
         userAgent: navigator.userAgent,
       });
-      const sid = res.data.sessionId;
-      setSessionId(sid);
-      localStorage.setItem('vstreamSessionId', sid);
+      localStorage.setItem('vstreamSessionId', res.data.sessionId);
     } catch (err) {
-      // Non-critical — don't block login if tracking fails
       console.warn('Session tracking start failed:', err.message);
     }
   };
 
   const logout = async () => {
-    // End session in admin tracker
+    // ✅ End admin session tracking
     try {
-      const sid = sessionId || localStorage.getItem('vstreamSessionId');
-      if (sid) {
-        await axios.post(`${API}/api/admin/session/end`, { sessionId: sid });
+      const sessionId = localStorage.getItem('vstreamSessionId');
+      if (sessionId) {
+        await axios.post(`${API}/api/admin/session/end`, { sessionId });
       }
     } catch (err) {
       console.warn('Session tracking end failed:', err.message);
     }
 
     setUser(null);
-    setSessionId(null);
     localStorage.removeItem('musicUser');
     localStorage.removeItem('vstreamSessionId');
     resetPlayer();
   };
 
-  // Exposed so MusicContext / PlayerBar can track song plays
-  const trackSong = async (songId, title, artist) => {
-    try {
-      const sid = sessionId || localStorage.getItem('vstreamSessionId');
-      if (!sid) return;
-      await axios.post(`${API}/api/admin/session/song`, { sessionId: sid, songId, title, artist });
-    } catch (err) {
-      // Non-critical
-    }
-  };
-
   return (
-    <AuthContext.Provider value={{ user, login, logout, loading, sessionId, trackSong }}>
+    <AuthContext.Provider value={{ user, login, logout, loading }}>
       {children}
     </AuthContext.Provider>
   );

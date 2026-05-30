@@ -6,10 +6,10 @@ const API = process.env.REACT_APP_API_URL || '';
 export const MusicContext = createContext();
 
 export const MusicProvider = ({ children }) => {
-  // Get auth token from localStorage to track recently played
   const getToken = () => {
     try { return JSON.parse(localStorage.getItem('musicUser'))?.token; } catch { return null; }
   };
+
   const [currentSong, setCurrentSong] = useState(null);
   const [isPlaying, setIsPlaying]     = useState(false);
   const [songKey, setSongKey]         = useState(0);
@@ -17,19 +17,37 @@ export const MusicProvider = ({ children }) => {
   const [shuffle, setShuffle]         = useState(false);
   const [repeat, setRepeat]           = useState('none'); // 'none' | 'one' | 'all'
 
+  // ── Internal helper: report song play to admin tracker ─────────────────
+  const reportSongPlay = (song) => {
+    try {
+      const sessionId = localStorage.getItem('vstreamSessionId');
+      if (!sessionId || !song) return;
+      axios.post(`${API}/api/admin/session/song`, {
+        sessionId,
+        songId: song._id || song.id || '',
+        title:  song.title || song.name || 'Unknown',
+        artist: song.artist || song.primaryArtists || song.singers || ''
+      }).catch(() => {}); // silent fail — never block playback
+    } catch {}
+  };
+
   const playSong = (song, playlistSongs = []) => {
     setCurrentSong(song);
     setIsPlaying(true);
     setSongKey(prev => prev + 1);
     if (playlistSongs.length > 0) setQueue(playlistSongs);
-    // Track recently played if user is logged in
+
+    // Track recently played
     const token = getToken();
     if (token && song?._id) {
       axios.post(`${API}/api/playlists/recently-played`,
         { songId: song._id },
         { headers: { Authorization: `Bearer ${token}` } }
-      ).catch(() => {}); // silent fail
+      ).catch(() => {});
     }
+
+    // ✅ Track for admin dashboard
+    reportSongPlay(song);
   };
 
   const addToQueue = (song) => {
@@ -39,7 +57,6 @@ export const MusicProvider = ({ children }) => {
     });
   };
 
-  // Get a random index from queue excluding current
   const getRandomIndex = useCallback((currentIndex, queueLength) => {
     if (queueLength <= 1) return 0;
     let rand;
@@ -49,86 +66,49 @@ export const MusicProvider = ({ children }) => {
   }, []);
 
   const playNext = useCallback(() => {
-    if (queue.length === 0) {
-      // No queue — repeat one restarts same song
-      if (repeat === 'one') {
-        setCurrentSong(prev => prev);
-        setIsPlaying(true);
-        setSongKey(prev => prev + 1);
-        return;
-      }
-      return;
-    }
-    const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
-
-    // Repeat one — restart the CURRENT song explicitly
+    if (!queue.length) return;
     if (repeat === 'one') {
-      setCurrentSong(prev => prev); // keep same song reference
-      setIsPlaying(true);
-      setSongKey(prev => prev + 1); // increment key to force re-init in PlayerBar
-      return;
-    }
-
-    // Shuffle — pick random song
-    if (shuffle) {
-      const randIndex = getRandomIndex(currentIndex, queue.length);
-      setCurrentSong(queue[randIndex]);
+      setCurrentSong(prev => prev);
       setIsPlaying(true);
       setSongKey(prev => prev + 1);
       return;
     }
-
-    const nextIndex = currentIndex + 1;
-
-    // Repeat all — loop back to start
-    if (nextIndex >= queue.length) {
-      if (repeat === 'all') {
-        setCurrentSong(queue[0]);
-        setIsPlaying(true);
-        setSongKey(prev => prev + 1);
-      } else {
-        setIsPlaying(false); // end of queue, no repeat
-      }
+    const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+    let nextIndex;
+    if (shuffle) {
+      nextIndex = getRandomIndex(currentIndex, queue.length);
+    } else if (currentIndex < queue.length - 1) {
+      nextIndex = currentIndex + 1;
+    } else if (repeat === 'all') {
+      nextIndex = 0;
+    } else {
       return;
     }
-
-    // Normal next
     setCurrentSong(queue[nextIndex]);
     setIsPlaying(true);
     setSongKey(prev => prev + 1);
+    reportSongPlay(queue[nextIndex]);
   }, [queue, currentSong, repeat, shuffle, getRandomIndex]);
 
   const playPrev = useCallback(() => {
-    if (queue.length === 0) return;
+    if (!queue.length) return;
     const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
-
-    // Shuffle — go to random song
+    let prevIndex;
     if (shuffle) {
-      const randIndex = getRandomIndex(currentIndex, queue.length);
-      setCurrentSong(queue[randIndex]);
-      setIsPlaying(true);
-      setSongKey(prev => prev + 1);
+      prevIndex = getRandomIndex(currentIndex, queue.length);
+    } else if (currentIndex > 0) {
+      prevIndex = currentIndex - 1;
+    } else if (repeat === 'all') {
+      prevIndex = queue.length - 1;
+    } else {
       return;
     }
-
-    const prevIndex = currentIndex - 1;
-
-    // Repeat all — wrap to last song
-    if (prevIndex < 0) {
-      if (repeat === 'all') {
-        setCurrentSong(queue[queue.length - 1]);
-        setIsPlaying(true);
-        setSongKey(prev => prev + 1);
-      }
-      return;
-    }
-
     setCurrentSong(queue[prevIndex]);
     setIsPlaying(true);
     setSongKey(prev => prev + 1);
+    reportSongPlay(queue[prevIndex]);
   }, [queue, currentSong, repeat, shuffle, getRandomIndex]);
 
-  // Cycle repeat: none → one → all → none
   const cycleRepeat = () => {
     setRepeat(prev =>
       prev === 'none' ? 'one' :
@@ -139,7 +119,6 @@ export const MusicProvider = ({ children }) => {
   const toggleShuffle = () => setShuffle(prev => !prev);
   const togglePlay    = () => setIsPlaying(prev => !prev);
 
-  // ✅ Called on logout — stops music and clears all player state
   const resetPlayer = () => {
     setCurrentSong(null);
     setIsPlaying(false);
@@ -161,6 +140,172 @@ export const MusicProvider = ({ children }) => {
     </MusicContext.Provider>
   );
 };
+
+//ADMIN 
+
+// import React, { createContext, useState, useCallback } from 'react';
+// import axios from 'axios';
+
+// const API = process.env.REACT_APP_API_URL || '';
+
+// export const MusicContext = createContext();
+
+// export const MusicProvider = ({ children }) => {
+//   // Get auth token from localStorage to track recently played
+//   const getToken = () => {
+//     try { return JSON.parse(localStorage.getItem('musicUser'))?.token; } catch { return null; }
+//   };
+//   const [currentSong, setCurrentSong] = useState(null);
+//   const [isPlaying, setIsPlaying]     = useState(false);
+//   const [songKey, setSongKey]         = useState(0);
+//   const [queue, setQueue]             = useState([]);
+//   const [shuffle, setShuffle]         = useState(false);
+//   const [repeat, setRepeat]           = useState('none'); // 'none' | 'one' | 'all'
+
+//   const playSong = (song, playlistSongs = []) => {
+//     setCurrentSong(song);
+//     setIsPlaying(true);
+//     setSongKey(prev => prev + 1);
+//     if (playlistSongs.length > 0) setQueue(playlistSongs);
+//     // Track recently played if user is logged in
+//     const token = getToken();
+//     if (token && song?._id) {
+//       axios.post(`${API}/api/playlists/recently-played`,
+//         { songId: song._id },
+//         { headers: { Authorization: `Bearer ${token}` } }
+//       ).catch(() => {}); // silent fail
+//     }
+//   };
+
+//   const addToQueue = (song) => {
+//     setQueue(prev => {
+//       if (prev.some(s => s._id === song._id)) return prev;
+//       return [...prev, song];
+//     });
+//   };
+
+//   // Get a random index from queue excluding current
+//   const getRandomIndex = useCallback((currentIndex, queueLength) => {
+//     if (queueLength <= 1) return 0;
+//     let rand;
+//     do { rand = Math.floor(Math.random() * queueLength); }
+//     while (rand === currentIndex);
+//     return rand;
+//   }, []);
+
+//   const playNext = useCallback(() => {
+//     if (queue.length === 0) {
+//       // No queue — repeat one restarts same song
+//       if (repeat === 'one') {
+//         setCurrentSong(prev => prev);
+//         setIsPlaying(true);
+//         setSongKey(prev => prev + 1);
+//         return;
+//       }
+//       return;
+//     }
+//     const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+
+//     // Repeat one — restart the CURRENT song explicitly
+//     if (repeat === 'one') {
+//       setCurrentSong(prev => prev); // keep same song reference
+//       setIsPlaying(true);
+//       setSongKey(prev => prev + 1); // increment key to force re-init in PlayerBar
+//       return;
+//     }
+
+//     // Shuffle — pick random song
+//     if (shuffle) {
+//       const randIndex = getRandomIndex(currentIndex, queue.length);
+//       setCurrentSong(queue[randIndex]);
+//       setIsPlaying(true);
+//       setSongKey(prev => prev + 1);
+//       return;
+//     }
+
+//     const nextIndex = currentIndex + 1;
+
+//     // Repeat all — loop back to start
+//     if (nextIndex >= queue.length) {
+//       if (repeat === 'all') {
+//         setCurrentSong(queue[0]);
+//         setIsPlaying(true);
+//         setSongKey(prev => prev + 1);
+//       } else {
+//         setIsPlaying(false); // end of queue, no repeat
+//       }
+//       return;
+//     }
+
+//     // Normal next
+//     setCurrentSong(queue[nextIndex]);
+//     setIsPlaying(true);
+//     setSongKey(prev => prev + 1);
+//   }, [queue, currentSong, repeat, shuffle, getRandomIndex]);
+
+//   const playPrev = useCallback(() => {
+//     if (queue.length === 0) return;
+//     const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+
+//     // Shuffle — go to random song
+//     if (shuffle) {
+//       const randIndex = getRandomIndex(currentIndex, queue.length);
+//       setCurrentSong(queue[randIndex]);
+//       setIsPlaying(true);
+//       setSongKey(prev => prev + 1);
+//       return;
+//     }
+
+//     const prevIndex = currentIndex - 1;
+
+//     // Repeat all — wrap to last song
+//     if (prevIndex < 0) {
+//       if (repeat === 'all') {
+//         setCurrentSong(queue[queue.length - 1]);
+//         setIsPlaying(true);
+//         setSongKey(prev => prev + 1);
+//       }
+//       return;
+//     }
+
+//     setCurrentSong(queue[prevIndex]);
+//     setIsPlaying(true);
+//     setSongKey(prev => prev + 1);
+//   }, [queue, currentSong, repeat, shuffle, getRandomIndex]);
+
+//   // Cycle repeat: none → one → all → none
+//   const cycleRepeat = () => {
+//     setRepeat(prev =>
+//       prev === 'none' ? 'one' :
+//       prev === 'one'  ? 'all' : 'none'
+//     );
+//   };
+
+//   const toggleShuffle = () => setShuffle(prev => !prev);
+//   const togglePlay    = () => setIsPlaying(prev => !prev);
+
+//   // ✅ Called on logout — stops music and clears all player state
+//   const resetPlayer = () => {
+//     setCurrentSong(null);
+//     setIsPlaying(false);
+//     setSongKey(0);
+//     setQueue([]);
+//     setShuffle(false);
+//     setRepeat('none');
+//   };
+
+//   return (
+//     <MusicContext.Provider value={{
+//       currentSong, songKey, isPlaying,
+//       queue, shuffle, repeat,
+//       playSong, playNext, playPrev, addToQueue,
+//       togglePlay, toggleShuffle, cycleRepeat, setIsPlaying,
+//       resetPlayer
+//     }}>
+//       {children}
+//     </MusicContext.Provider>
+//   );
+// };
 
 
 
