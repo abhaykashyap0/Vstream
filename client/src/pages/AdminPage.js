@@ -95,7 +95,7 @@ const LoginGate = ({ onAuth }) => {
 };
 
 // ── Main Dashboard ─────────────────────────────────────────────────────────
-const AdminDashboard = ({ adminKey }) => {
+const AdminDashboard = ({ adminKey, onLogout }) => {
   const [data, setData]       = useState(null);
   const [loading, setLoading] = useState(true);
   const [tab, setTab]         = useState('overview');   // overview | sessions | users | songs
@@ -137,6 +137,7 @@ const AdminDashboard = ({ adminKey }) => {
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           <span style={{ color: '#555', fontSize: '0.78rem' }}>Last refreshed {fmtRelative(new Date())}</span>
           <button onClick={fetchDashboard} style={{ ...s.btn, padding: '7px 14px', fontSize: '0.8rem' }}>↻ Refresh</button>
+          <button onClick={onLogout} style={{ background: 'transparent', border: '1px solid #333', color: '#888', borderRadius: '8px', padding: '7px 14px', fontWeight: 600, cursor: 'pointer', fontSize: '0.8rem' }}>⎋ Logout</button>
         </div>
       </div>
 
@@ -306,39 +307,128 @@ const AdminDashboard = ({ adminKey }) => {
             </div>
 
             {/* User detail panel */}
-            {selectedUser && userDetail && (
-              <div style={s.card}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '16px' }}>
-                  <div style={s.sectionTitle}>📊 {userDetail.user?.username}'s Activity</div>
-                  <button onClick={() => { setSelectedUser(null); setUserDetail(null); }}
-                    style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '1.2rem' }}>✕</button>
-                </div>
-                <div style={{ marginBottom: '16px', fontSize: '0.82rem', color: '#666' }}>
-                  <div>Email: {userDetail.user?.email}</div>
-                  <div>Joined: {fmtDate(userDetail.user?.createdAt)}</div>
-                </div>
-                {userDetail.sessions.map(sess => (
-                  <div key={sess._id} style={{ borderTop: '1px solid #1e1e1e', paddingTop: '12px', marginTop: '12px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-                      <span style={{ fontSize: '0.8rem', color: '#aaa' }}>{fmtDate(sess.loginAt)}</span>
-                      <span style={s.badge(sess.logoutAt ? '#888' : '#1db954')}>{sess.logoutAt ? fmtDuration(sess.durationMs) : '● live'}</span>
+            {selectedUser && userDetail && (() => {
+              // Flatten all songs across all sessions for this user
+              const allSongs = userDetail.sessions.flatMap(sess => sess.songsPlayed || []);
+
+              // Count play frequency per song title
+              const freq = {};
+              allSongs.forEach(song => {
+                const key = song.title || 'Unknown';
+                if (!freq[key]) freq[key] = { title: song.title, artist: song.artist, count: 0, lastPlayed: song.playedAt };
+                freq[key].count++;
+                if (new Date(song.playedAt) > new Date(freq[key].lastPlayed)) freq[key].lastPlayed = song.playedAt;
+              });
+
+              const sortedSongs = Object.values(freq).sort((a, b) => b.count - a.count);
+              const totalPlayed = allSongs.length;
+              const showTop = Math.min(sortedSongs.length, 10); // up to 10, less if not enough yet
+              const topSongsForUser = sortedSongs.slice(0, showTop);
+              const hasEnough = totalPlayed >= 10;
+
+              return (
+                <div style={s.card}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '16px' }}>
+                    <div style={s.sectionTitle}>📊 {userDetail.user?.username}'s Activity</div>
+                    <button onClick={() => { setSelectedUser(null); setUserDetail(null); }}
+                      style={{ background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '1.2rem' }}>✕</button>
+                  </div>
+
+                  <div style={{ marginBottom: '20px', fontSize: '0.82rem', color: '#666' }}>
+                    <div>Email: {userDetail.user?.email}</div>
+                    <div>Joined: {fmtDate(userDetail.user?.createdAt)}</div>
+                  </div>
+
+                  {/* Top songs section */}
+                  <div style={{ marginBottom: '20px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 700, color: '#ddd' }}>
+                        {hasEnough ? '🏆 Top 10 Songs' : `🎵 Songs Played (${totalPlayed} so far)`}
+                      </div>
+                      {!hasEnough && totalPlayed > 0 && (
+                        <div style={{ fontSize: '0.72rem', color: '#555', background: '#1a1a1a', padding: '3px 10px', borderRadius: '20px' }}>
+                          {10 - totalPlayed} more to unlock top 10
+                        </div>
+                      )}
                     </div>
-                    {sess.songsPlayed?.length > 0 && (
-                      <div style={{ paddingLeft: '8px' }}>
-                        {sess.songsPlayed.map((song, i) => (
-                          <div key={i} style={{ fontSize: '0.78rem', color: '#888', padding: '3px 0', borderLeft: '2px solid #1db95444', paddingLeft: '8px', marginBottom: '3px' }}>
-                            🎵 <span style={{ color: '#ccc' }}>{song.title}</span>
-                            {song.artist && <span style={{ color: '#666' }}> — {song.artist}</span>}
-                            <span style={{ color: '#444', marginLeft: '6px' }}>{fmtRelative(song.playedAt)}</span>
+
+                    {totalPlayed === 0 ? (
+                      <div style={{ fontSize: '0.8rem', color: '#444', fontStyle: 'italic', padding: '12px 0' }}>
+                        No songs played yet
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                        {topSongsForUser.map((song, i) => (
+                          <div key={i} style={{
+                            display: 'flex', alignItems: 'center', gap: '10px',
+                            background: i === 0 && hasEnough ? 'rgba(29,185,84,0.07)' : '#111',
+                            border: `1px solid ${i === 0 && hasEnough ? '#1db95433' : '#1e1e1e'}`,
+                            borderRadius: '8px', padding: '8px 12px'
+                          }}>
+                            <span style={{
+                              minWidth: '22px', textAlign: 'center', fontWeight: 700,
+                              fontSize: '0.8rem',
+                              color: i === 0 ? '#1db954' : i === 1 ? '#aaa' : i === 2 ? '#cd7f32' : '#444'
+                            }}>
+                              {i === 0 && hasEnough ? '🥇' : i === 1 && hasEnough ? '🥈' : i === 2 && hasEnough ? '🥉' : `${i + 1}`}
+                            </span>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ color: '#ddd', fontSize: '0.82rem', fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                {song.title || 'Unknown'}
+                              </div>
+                              {song.artist && (
+                                <div style={{ color: '#666', fontSize: '0.74rem' }}>{song.artist}</div>
+                              )}
+                            </div>
+                            <span style={{
+                              fontSize: '0.72rem', fontWeight: 700, whiteSpace: 'nowrap',
+                              color: song.count >= 5 ? '#1db954' : '#666'
+                            }}>
+                              {song.count} {song.count === 1 ? 'play' : 'plays'}
+                            </span>
                           </div>
                         ))}
                       </div>
                     )}
-                    {!sess.songsPlayed?.length && <div style={{ fontSize: '0.76rem', color: '#444', paddingLeft: '8px' }}>No songs tracked this session</div>}
+
+                    {/* Progress bar toward 10 songs for new users */}
+                    {!hasEnough && (
+                      <div style={{ marginTop: '12px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', color: '#444', marginBottom: '4px' }}>
+                          <span>Progress to Top 10</span>
+                          <span>{totalPlayed}/10</span>
+                        </div>
+                        <div style={{ background: '#1a1a1a', borderRadius: '4px', height: '4px', overflow: 'hidden' }}>
+                          <div style={{
+                            width: `${Math.min((totalPlayed / 10) * 100, 100)}%`,
+                            height: '100%', background: '#1db954',
+                            borderRadius: '4px', transition: 'width 0.4s'
+                          }} />
+                        </div>
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
-            )}
+
+                  {/* Session history */}
+                  <div style={{ fontSize: '0.85rem', fontWeight: 700, color: '#ddd', marginBottom: '10px' }}>📋 Session History</div>
+                  {userDetail.sessions.map(sess => (
+                    <div key={sess._id} style={{ borderTop: '1px solid #1e1e1e', paddingTop: '10px', marginTop: '10px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '0.78rem', color: '#aaa' }}>{fmtDate(sess.loginAt)}</span>
+                        <span style={s.badge(sess.logoutAt ? '#888' : '#1db954')}>
+                          {sess.logoutAt ? fmtDuration(sess.durationMs) : '● live'}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: '0.74rem', color: '#555' }}>
+                        {sess.songsPlayed?.length > 0
+                          ? `${sess.songsPlayed.length} song${sess.songsPlayed.length > 1 ? 's' : ''} played`
+                          : 'No songs this session'}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
           </div>
         )}
 
@@ -383,8 +473,13 @@ const AdminPage = () => {
     sessionStorage.setItem('vstreamAdminKey', key);
   };
 
+  const handleLogout = () => {
+    setAdminKey('');
+    sessionStorage.removeItem('vstreamAdminKey');
+  };
+
   if (!adminKey) return <LoginGate onAuth={handleAuth} />;
-  return <AdminDashboard adminKey={adminKey} />;
+  return <AdminDashboard adminKey={adminKey} onLogout={handleLogout} />;
 };
 
 export default AdminPage;
