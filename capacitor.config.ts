@@ -1,0 +1,13 @@
+import type { CapacitorConfig } from '@capacitor/cli';
+
+const config: CapacitorConfig = {
+  appId: 'com.vstream.app',
+  appName: 'VStream',
+  webDir: 'client/build',
+  server: {
+    url: 'https://vstream-black.vercel.app/',
+    cleartext: true
+  }
+};
+
+export default config;

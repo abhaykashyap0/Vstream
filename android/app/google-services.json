@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "770566078037",
+    "project_id": "vstream-80b26",
+    "storage_bucket": "vstream-80b26.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:770566078037:android:a6e344c178350b8c6a5edc",
+        "android_client_info": {
+          "package_name": "com.vstream.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBG7XizQK6oe8RodcPwrhYLQ4fp95rug04"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

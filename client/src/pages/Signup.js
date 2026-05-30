@@ -27,13 +27,7 @@ const Signup = () => {
 
   const reset = () => { setStep(1); setOtp(['','','','','','']); setError(''); setSuccess(''); };
 
-  useEffect(() => {
-    if (method === 'phone' && !recaptchaRef.current) {
-      recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', {
-        size: 'invisible'
-      });
-    }
-  }, [method]);
+  // Recaptcha is initialized lazily inside handlePhoneSendOtp for APK compatibility
 
   const handleOtpInput = (e) => {
     const value = e.target.value.replace(/\D/g, '').slice(0, 6);
@@ -76,20 +70,33 @@ const Signup = () => {
   };
 
   const handlePhoneSendOtp = async (e) => {
-    e.preventDefault();
+    e?.preventDefault();
     setLoading(true); setError('');
     try {
-      if (!recaptchaRef.current) {
-        recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', { size: 'invisible' });
+      // Always recreate recaptcha fresh — required for WebView/APK compatibility
+      if (recaptchaRef.current) {
+        try { recaptchaRef.current.clear(); } catch {}
+        recaptchaRef.current = null;
       }
+      recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-signup', {
+        size: 'invisible',
+        callback: () => {},
+        'expired-callback': () => {
+          recaptchaRef.current = null;
+        }
+      });
+      await recaptchaRef.current.render();
       const result = await signInWithPhoneNumber(auth, formData.phone, recaptchaRef.current);
       setConfirmResult(result);
       setSuccess(`OTP sent to ${formData.phone}`);
       setStep(2);
     } catch (err) {
       console.error('Firebase send OTP error:', err);
-      setError('Failed to send OTP. Check phone number format (+91XXXXXXXXXX)');
-      recaptchaRef.current = null;
+      if (recaptchaRef.current) {
+        try { recaptchaRef.current.clear(); } catch {}
+        recaptchaRef.current = null;
+      }
+      setError(err?.message || 'Failed to send OTP. Check phone number format (+91XXXXXXXXXX)');
     } finally { setLoading(false); }
   };
 
