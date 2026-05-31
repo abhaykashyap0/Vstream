@@ -1,32 +1,24 @@
 import React, { useState, useContext, useRef, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import axios from 'axios';
-import { RecaptchaVerifier, signInWithPhoneNumber } from 'firebase/auth';
-import { auth } from '../firebase';
 import { AuthContext } from '../context/AuthContext';
-import { Music, Mail, Phone, ArrowLeft } from 'lucide-react';
+import { Music, Mail, ArrowLeft } from 'lucide-react';
 
 const API = process.env.REACT_APP_API_URL || '';
 
 const Login = () => {
-  const [method, setMethod]       = useState('email');
   const [loginType, setLoginType] = useState('password');
   const [step, setStep]           = useState(1);
-  const [formData, setFormData]   = useState({ email: '', phone: '', password: '' });
+  const [formData, setFormData]   = useState({ email: '', password: '' });
   const [otp, setOtp]             = useState(['','','','','','']);
   const [loading, setLoading]     = useState(false);
   const [error, setError]         = useState('');
   const [success, setSuccess]     = useState('');
-  const [confirmResult, setConfirmResult] = useState(null);
-  const otpRefs        = useRef([]);
   const hiddenInputRef = useRef(null);
-  const recaptchaRef   = useRef(null);
   const { login }      = useContext(AuthContext);
   const navigate       = useNavigate();
 
   const reset = () => { setStep(1); setOtp(['','','','','','']); setError(''); setSuccess(''); };
-
-  // Recaptcha is initialized lazily inside handlePhoneSendOtp for APK compatibility
 
   const handleOtpInput = (e) => {
     const value = e.target.value.replace(/\D/g, '').slice(0, 6);
@@ -69,67 +61,12 @@ const Login = () => {
       login(data); navigate('/');
     } catch (err) {
       setError(err.response?.data?.message || 'Invalid OTP');
-      setOtp(['','','','','','']); otpRefs.current[0]?.focus();
+      setOtp(['','','','','','']);
     } finally { setLoading(false); }
   };
 
-  // ── Phone login via Firebase ───────────────────────────────────
-  // const handlePhoneSendOtp = async (e) => {
-  //   e?.preventDefault();
-  //   setLoading(true); setError('');
-  //   try {
-  //     // Clear old recaptcha
-  //     if (recaptchaRef.current) {
-  //       try { recaptchaRef.current.clear(); } catch {}
-  //       recaptchaRef.current = null;
-  //     }
-  //     // Wipe the container div so reCAPTCHA can render fresh
-  //     const container = document.getElementById('recaptcha-container-login');
-  //     if (container) container.innerHTML = '';
-
-  //     recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-login', {
-  //       size: 'invisible',
-  //       callback: () => {},
-  //       'expired-callback': () => { recaptchaRef.current = null; }
-  //     });
-  //     await recaptchaRef.current.render();
-  //     const result = await signInWithPhoneNumber(auth, formData.phone, recaptchaRef.current);
-  //     setConfirmResult(result);
-  //     setSuccess(`OTP sent to ${formData.phone}`);
-  //     setStep(2);
-  //   } catch (err) {
-  //     console.error('Firebase OTP error:', err);
-  //     if (recaptchaRef.current) {
-  //       try { recaptchaRef.current.clear(); } catch {}
-  //       recaptchaRef.current = null;
-  //     }
-  //     const container = document.getElementById('recaptcha-container-login');
-  //     if (container) container.innerHTML = '';
-  //     setError(err?.message || 'Failed to send OTP. Check phone format (+91XXXXXXXXXX)');
-  //   } finally { setLoading(false); }
-  // };
-
-  // const handlePhoneVerifyOtp = async () => {
-  //   const otpString = otp.join('');
-  //   if (otpString.length !== 6) return setError('Enter complete 6-digit OTP');
-  //   setLoading(true); setError('');
-  //   try {
-  //     const result    = await confirmResult.confirm(otpString);
-  //     const token     = await result.user.getIdToken();
-  //     const { data }  = await axios.post(`${API}/api/auth/phone/firebase-verify`, { firebaseToken: token });
-  //     if (data.needsUsername) {
-  //       return setError('No account found. Please sign up first.');
-  //     }
-  //     login(data); navigate('/');
-  //   } catch (err) {
-  //     setError(err.response?.data?.message || 'Invalid OTP');
-  //     setOtp(['','','','','','']); otpRefs.current[0]?.focus();
-  //   } finally { setLoading(false); }
-  // };
-
   const OtpBoxes = ({ onVerify }) => (
     <>
-      {/* Single hidden input captures all typing */}
       <input
         ref={hiddenInputRef}
         type="tel"
@@ -137,14 +74,12 @@ const Login = () => {
         value={otp.join('')}
         onChange={handleOtpInput}
         maxLength={6}
+        autoComplete="one-time-code"
         style={{
           position: 'absolute', opacity: 0, pointerEvents: 'none',
           width: 0, height: 0, border: 'none', outline: 'none'
         }}
-        autoComplete="one-time-code"
       />
-
-      {/* Visual boxes */}
       <div
         style={{ display: 'flex', gap: 'clamp(6px, 2vw, 12px)', justifyContent: 'center', marginBottom: '24px', cursor: 'text' }}
         onClick={() => hiddenInputRef.current?.focus()}
@@ -153,30 +88,24 @@ const Login = () => {
           const isActive = otp.filter(Boolean).length === i ||
                            (i === 5 && otp.filter(Boolean).length === 6);
           return (
-            <div
-              key={i}
-              onClick={() => hiddenInputRef.current?.focus()}
+            <div key={i} onClick={() => hiddenInputRef.current?.focus()}
               style={{
                 width: '44px', height: '54px',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 fontSize: '1.6rem', fontWeight: 700,
                 background: digit ? 'rgba(29,185,84,0.15)' : '#1a1a1a',
                 border: `2px solid ${isActive ? '#1db954' : digit ? '#1db954' : '#444'}`,
-                borderRadius: '10px', color: 'white',
-                transition: 'all 0.15s',
+                borderRadius: '10px', color: 'white', transition: 'all 0.15s',
                 boxShadow: isActive ? '0 0 0 3px rgba(29,185,84,0.2)' : 'none',
                 userSelect: 'none', cursor: 'text'
-              }}
-            >
+              }}>
               {digit || (isActive ?
                 <span style={{ width: '2px', height: '24px', background: '#1db954', animation: 'blink 1s infinite' }} />
-                : ''
-              )}
+                : '')}
             </div>
           );
         })}
       </div>
-
       <button onClick={onVerify} className="btn-primary" disabled={loading}
         style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
         {loading ? 'Verifying...' : 'Verify OTP'}
@@ -192,29 +121,10 @@ const Login = () => {
         <p style={{ color: '#b3b3b3', marginTop: '6px', fontSize: '0.9rem' }}>Log in to VStream</p>
       </div>
 
-      {step === 1 && (
-        <div style={{ display: 'flex', background: '#121212', borderRadius: '8px', padding: '4px', marginBottom: '20px' }}>
-          {['email','phone'].map(m => (
-            <button key={m} onClick={() => { setMethod(m); reset(); setLoginType('password'); }}
-              style={{
-                flex: 1, padding: '9px', border: 'none', borderRadius: '6px', cursor: 'pointer',
-                fontWeight: 600, fontSize: '0.88rem', transition: 'all 0.2s',
-                background: method === m ? '#1db954' : 'transparent',
-                color: method === m ? 'white' : '#b3b3b3',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px'
-              }}>
-              {m === 'email' ? <Mail size={15}/> : <Phone size={15}/>}
-              {m === 'email' ? 'Email' : 'Phone'}
-            </button>
-          ))}
-        </div>
-      )}
-
       {error && <div style={{ background: '#2a1a1a', border: '1px solid #ff4444', borderRadius: '8px', padding: '10px 14px', color: '#ff6666', fontSize: '0.85rem', marginBottom: '14px' }}>{error}</div>}
       {success && <div style={{ background: '#1a2a1a', border: '1px solid #1db954', borderRadius: '8px', padding: '10px 14px', color: '#1db954', fontSize: '0.85rem', marginBottom: '14px' }}>{success}</div>}
 
-      {/* ── STEP 1 EMAIL ── */}
-      {step === 1 && method === 'email' && (
+      {step === 1 && (
         <>
           <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
             {['password','otp'].map(t => (
@@ -229,6 +139,7 @@ const Login = () => {
               </button>
             ))}
           </div>
+
           {loginType === 'password' ? (
             <form onSubmit={handlePasswordLogin}>
               <input type="email" placeholder="Email address" required value={formData.email} onChange={e => setFormData({...formData, email: e.target.value})} />
@@ -248,19 +159,6 @@ const Login = () => {
         </>
       )}
 
-      {/* ── STEP 1 PHONE ── */}
-      {step === 1 && method === 'phone' && (
-        <form onSubmit={handlePhoneSendOtp}>
-          <input type="tel" placeholder="+91 9876543210" required value={formData.phone} onChange={e => setFormData({...formData, phone: e.target.value})} />
-          <p style={{ color: '#666', fontSize: '0.78rem', marginTop: '-8px', marginBottom: '14px' }}>Include country code e.g. +91 for India</p>
-          <div id="recaptcha-container-login"></div>
-          <button type="submit" className="btn-primary" disabled={loading} style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
-            {loading ? 'Sending...' : 'Send OTP via SMS'}
-          </button>
-        </form>
-      )}
-
-      {/* ── STEP 2 OTP ── */}
       {step === 2 && (() => { setTimeout(() => hiddenInputRef.current?.focus(), 100); return null; })()}
       {step === 2 && (
         <div>
@@ -269,10 +167,10 @@ const Login = () => {
           </button>
           <p style={{ color: '#b3b3b3', fontSize: '0.9rem', marginBottom: '20px', textAlign: 'center' }}>
             Enter the 6-digit code sent to<br />
-            <strong style={{ color: 'white' }}>{method === 'email' ? formData.email : formData.phone}</strong>
+            <strong style={{ color: 'white' }}>{formData.email}</strong>
           </p>
-          <OtpBoxes onVerify={method === 'phone' ? handlePhoneVerifyOtp : handleEmailVerifyOtp} />
-          <button onClick={method === 'phone' ? handlePhoneSendOtp : handleEmailSendOtp}
+          <OtpBoxes onVerify={handleEmailVerifyOtp} />
+          <button onClick={handleEmailSendOtp}
             style={{ width: '100%', background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', marginTop: '12px', fontSize: '0.85rem' }}>
             Didn't receive it? <span style={{ color: '#1db954' }}>Resend OTP</span>
           </button>
@@ -288,6 +186,301 @@ const Login = () => {
 };
 
 export default Login;
+
+
+//phone removed 
+
+
+// import React, { useState, useContext, useRef, useEffect } from 'react';
+// import { useNavigate, Link } from 'react-router-dom';
+// import axios from 'axios';
+// import { RecaptchaVerifier, signInWithPhoneNumber } from 'firebase/auth';
+// import { auth } from '../firebase';
+// import { AuthContext } from '../context/AuthContext';
+// import { Music, Mail, Phone, ArrowLeft } from 'lucide-react';
+
+// const API = process.env.REACT_APP_API_URL || '';
+
+// const Login = () => {
+//   const [method, setMethod]       = useState('email');
+//   const [loginType, setLoginType] = useState('password');
+//   const [step, setStep]           = useState(1);
+//   const [formData, setFormData]   = useState({ email: '', phone: '', password: '' });
+//   const [otp, setOtp]             = useState(['','','','','','']);
+//   const [loading, setLoading]     = useState(false);
+//   const [error, setError]         = useState('');
+//   const [success, setSuccess]     = useState('');
+//   const [confirmResult, setConfirmResult] = useState(null);
+//   const otpRefs        = useRef([]);
+//   const hiddenInputRef = useRef(null);
+//   const recaptchaRef   = useRef(null);
+//   const { login }      = useContext(AuthContext);
+//   const navigate       = useNavigate();
+
+//   const reset = () => { setStep(1); setOtp(['','','','','','']); setError(''); setSuccess(''); };
+
+//   // Recaptcha is initialized lazily inside handlePhoneSendOtp for APK compatibility
+
+//   const handleOtpInput = (e) => {
+//     const value = e.target.value.replace(/\D/g, '').slice(0, 6);
+//     const arr = value.split('');
+//     const newOtp = ['','','','','',''];
+//     arr.forEach((d, i) => { newOtp[i] = d; });
+//     setOtp(newOtp);
+//   };
+
+//   // ── Password login ─────────────────────────────────────────────
+//   const handlePasswordLogin = async (e) => {
+//     e.preventDefault();
+//     setLoading(true); setError('');
+//     try {
+//       const { data } = await axios.post(`${API}/api/auth/login`, { email: formData.email, password: formData.password });
+//       login(data); navigate('/');
+//     } catch (err) {
+//       setError(err.response?.data?.message || 'Login failed');
+//     } finally { setLoading(false); }
+//   };
+
+//   // ── Email OTP login ────────────────────────────────────────────
+//   const handleEmailSendOtp = async (e) => {
+//     e?.preventDefault();
+//     setLoading(true); setError(''); setSuccess('');
+//     try {
+//       const { data } = await axios.post(`${API}/api/auth/login/send-otp`, { email: formData.email });
+//       setSuccess(data.message); setStep(2);
+//     } catch (err) {
+//       setError(err.response?.data?.message || 'Failed to send OTP');
+//     } finally { setLoading(false); }
+//   };
+
+//   const handleEmailVerifyOtp = async () => {
+//     const otpString = otp.join('');
+//     if (otpString.length !== 6) return setError('Enter complete 6-digit OTP');
+//     setLoading(true); setError('');
+//     try {
+//       const { data } = await axios.post(`${API}/api/auth/login/verify-otp`, { email: formData.email, otp: otpString });
+//       login(data); navigate('/');
+//     } catch (err) {
+//       setError(err.response?.data?.message || 'Invalid OTP');
+//       setOtp(['','','','','','']); otpRefs.current[0]?.focus();
+//     } finally { setLoading(false); }
+//   };
+
+//   // ── Phone login via Firebase ───────────────────────────────────
+//   // const handlePhoneSendOtp = async (e) => {
+//   //   e?.preventDefault();
+//   //   setLoading(true); setError('');
+//   //   try {
+//   //     // Clear old recaptcha
+//   //     if (recaptchaRef.current) {
+//   //       try { recaptchaRef.current.clear(); } catch {}
+//   //       recaptchaRef.current = null;
+//   //     }
+//   //     // Wipe the container div so reCAPTCHA can render fresh
+//   //     const container = document.getElementById('recaptcha-container-login');
+//   //     if (container) container.innerHTML = '';
+
+//   //     recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-login', {
+//   //       size: 'invisible',
+//   //       callback: () => {},
+//   //       'expired-callback': () => { recaptchaRef.current = null; }
+//   //     });
+//   //     await recaptchaRef.current.render();
+//   //     const result = await signInWithPhoneNumber(auth, formData.phone, recaptchaRef.current);
+//   //     setConfirmResult(result);
+//   //     setSuccess(`OTP sent to ${formData.phone}`);
+//   //     setStep(2);
+//   //   } catch (err) {
+//   //     console.error('Firebase OTP error:', err);
+//   //     if (recaptchaRef.current) {
+//   //       try { recaptchaRef.current.clear(); } catch {}
+//   //       recaptchaRef.current = null;
+//   //     }
+//   //     const container = document.getElementById('recaptcha-container-login');
+//   //     if (container) container.innerHTML = '';
+//   //     setError(err?.message || 'Failed to send OTP. Check phone format (+91XXXXXXXXXX)');
+//   //   } finally { setLoading(false); }
+//   // };
+
+//   // const handlePhoneVerifyOtp = async () => {
+//   //   const otpString = otp.join('');
+//   //   if (otpString.length !== 6) return setError('Enter complete 6-digit OTP');
+//   //   setLoading(true); setError('');
+//   //   try {
+//   //     const result    = await confirmResult.confirm(otpString);
+//   //     const token     = await result.user.getIdToken();
+//   //     const { data }  = await axios.post(`${API}/api/auth/phone/firebase-verify`, { firebaseToken: token });
+//   //     if (data.needsUsername) {
+//   //       return setError('No account found. Please sign up first.');
+//   //     }
+//   //     login(data); navigate('/');
+//   //   } catch (err) {
+//   //     setError(err.response?.data?.message || 'Invalid OTP');
+//   //     setOtp(['','','','','','']); otpRefs.current[0]?.focus();
+//   //   } finally { setLoading(false); }
+//   // };
+
+//   const OtpBoxes = ({ onVerify }) => (
+//     <>
+//       {/* Single hidden input captures all typing */}
+//       <input
+//         ref={hiddenInputRef}
+//         type="tel"
+//         inputMode="numeric"
+//         value={otp.join('')}
+//         onChange={handleOtpInput}
+//         maxLength={6}
+//         style={{
+//           position: 'absolute', opacity: 0, pointerEvents: 'none',
+//           width: 0, height: 0, border: 'none', outline: 'none'
+//         }}
+//         autoComplete="one-time-code"
+//       />
+
+//       {/* Visual boxes */}
+//       <div
+//         style={{ display: 'flex', gap: 'clamp(6px, 2vw, 12px)', justifyContent: 'center', marginBottom: '24px', cursor: 'text' }}
+//         onClick={() => hiddenInputRef.current?.focus()}
+//       >
+//         {otp.map((digit, i) => {
+//           const isActive = otp.filter(Boolean).length === i ||
+//                            (i === 5 && otp.filter(Boolean).length === 6);
+//           return (
+//             <div
+//               key={i}
+//               onClick={() => hiddenInputRef.current?.focus()}
+//               style={{
+//                 width: '44px', height: '54px',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center',
+//                 fontSize: '1.6rem', fontWeight: 700,
+//                 background: digit ? 'rgba(29,185,84,0.15)' : '#1a1a1a',
+//                 border: `2px solid ${isActive ? '#1db954' : digit ? '#1db954' : '#444'}`,
+//                 borderRadius: '10px', color: 'white',
+//                 transition: 'all 0.15s',
+//                 boxShadow: isActive ? '0 0 0 3px rgba(29,185,84,0.2)' : 'none',
+//                 userSelect: 'none', cursor: 'text'
+//               }}
+//             >
+//               {digit || (isActive ?
+//                 <span style={{ width: '2px', height: '24px', background: '#1db954', animation: 'blink 1s infinite' }} />
+//                 : ''
+//               )}
+//             </div>
+//           );
+//         })}
+//       </div>
+
+//       <button onClick={onVerify} className="btn-primary" disabled={loading}
+//         style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//         {loading ? 'Verifying...' : 'Verify OTP'}
+//       </button>
+//     </>
+//   );
+
+//   return (
+//     <div className="auth-form">
+//       <div style={{ textAlign: 'center', marginBottom: '24px' }}>
+//         <Music color="#1db954" size={36} style={{ marginBottom: '10px' }} />
+//         <h2 style={{ margin: 0 }}>Welcome back</h2>
+//         <p style={{ color: '#b3b3b3', marginTop: '6px', fontSize: '0.9rem' }}>Log in to VStream</p>
+//       </div>
+
+//       {step === 1 && (
+//         <div style={{ display: 'flex', background: '#121212', borderRadius: '8px', padding: '4px', marginBottom: '20px' }}>
+//           {['email','phone'].map(m => (
+//             <button key={m} onClick={() => { setMethod(m); reset(); setLoginType('password'); }}
+//               style={{
+//                 flex: 1, padding: '9px', border: 'none', borderRadius: '6px', cursor: 'pointer',
+//                 fontWeight: 600, fontSize: '0.88rem', transition: 'all 0.2s',
+//                 background: method === m ? '#1db954' : 'transparent',
+//                 color: method === m ? 'white' : '#b3b3b3',
+//                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px'
+//               }}>
+//               {m === 'email' ? <Mail size={15}/> : <Phone size={15}/>}
+//               {m === 'email' ? 'Email' : 'Phone'}
+//             </button>
+//           ))}
+//         </div>
+//       )}
+
+//       {error && <div style={{ background: '#2a1a1a', border: '1px solid #ff4444', borderRadius: '8px', padding: '10px 14px', color: '#ff6666', fontSize: '0.85rem', marginBottom: '14px' }}>{error}</div>}
+//       {success && <div style={{ background: '#1a2a1a', border: '1px solid #1db954', borderRadius: '8px', padding: '10px 14px', color: '#1db954', fontSize: '0.85rem', marginBottom: '14px' }}>{success}</div>}
+
+//       {/* ── STEP 1 EMAIL ── */}
+//       {step === 1 && method === 'email' && (
+//         <>
+//           <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
+//             {['password','otp'].map(t => (
+//               <button key={t} onClick={() => { setLoginType(t); setError(''); }}
+//                 style={{
+//                   flex: 1, padding: '8px', border: `1px solid ${loginType === t ? '#1db954' : '#333'}`,
+//                   borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.82rem',
+//                   background: loginType === t ? 'rgba(29,185,84,0.1)' : 'transparent',
+//                   color: loginType === t ? '#1db954' : '#b3b3b3', transition: 'all 0.2s'
+//                 }}>
+//                 {t === 'password' ? '🔑 Password' : '📧 Email OTP'}
+//               </button>
+//             ))}
+//           </div>
+//           {loginType === 'password' ? (
+//             <form onSubmit={handlePasswordLogin}>
+//               <input type="email" placeholder="Email address" required value={formData.email} onChange={e => setFormData({...formData, email: e.target.value})} />
+//               <input type="password" placeholder="Password" required value={formData.password} onChange={e => setFormData({...formData, password: e.target.value})} />
+//               <button type="submit" className="btn-primary" disabled={loading} style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//                 {loading ? 'Logging in...' : 'Log In'}
+//               </button>
+//             </form>
+//           ) : (
+//             <form onSubmit={handleEmailSendOtp}>
+//               <input type="email" placeholder="Email address" required value={formData.email} onChange={e => setFormData({...formData, email: e.target.value})} />
+//               <button type="submit" className="btn-primary" disabled={loading} style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//                 {loading ? 'Sending...' : 'Send OTP'}
+//               </button>
+//             </form>
+//           )}
+//         </>
+//       )}
+
+//       {/* ── STEP 1 PHONE ── */}
+//       {step === 1 && method === 'phone' && (
+//         <form onSubmit={handlePhoneSendOtp}>
+//           <input type="tel" placeholder="+91 9876543210" required value={formData.phone} onChange={e => setFormData({...formData, phone: e.target.value})} />
+//           <p style={{ color: '#666', fontSize: '0.78rem', marginTop: '-8px', marginBottom: '14px' }}>Include country code e.g. +91 for India</p>
+//           <div id="recaptcha-container-login"></div>
+//           <button type="submit" className="btn-primary" disabled={loading} style={{ width: '100%', borderRadius: '8px', padding: '13px', fontSize: '1rem' }}>
+//             {loading ? 'Sending...' : 'Send OTP via SMS'}
+//           </button>
+//         </form>
+//       )}
+
+//       {/* ── STEP 2 OTP ── */}
+//       {step === 2 && (() => { setTimeout(() => hiddenInputRef.current?.focus(), 100); return null; })()}
+//       {step === 2 && (
+//         <div>
+//           <button onClick={reset} style={{ background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '20px', padding: 0 }}>
+//             <ArrowLeft size={16} /> Back
+//           </button>
+//           <p style={{ color: '#b3b3b3', fontSize: '0.9rem', marginBottom: '20px', textAlign: 'center' }}>
+//             Enter the 6-digit code sent to<br />
+//             <strong style={{ color: 'white' }}>{method === 'email' ? formData.email : formData.phone}</strong>
+//           </p>
+//           <OtpBoxes onVerify={method === 'phone' ? handlePhoneVerifyOtp : handleEmailVerifyOtp} />
+//           <button onClick={method === 'phone' ? handlePhoneSendOtp : handleEmailSendOtp}
+//             style={{ width: '100%', background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', marginTop: '12px', fontSize: '0.85rem' }}>
+//             Didn't receive it? <span style={{ color: '#1db954' }}>Resend OTP</span>
+//           </button>
+//         </div>
+//       )}
+
+//       <p style={{ marginTop: '20px', textAlign: 'center', color: '#b3b3b3', fontSize: '0.9rem' }}>
+//         Don't have an account?{' '}
+//         <Link to="/signup" style={{ color: '#1db954', fontWeight: 600 }}>Sign up free</Link>
+//       </p>
+//     </div>
+//   );
+// };
+
+// export default Login;
 
 
 // add admin 
