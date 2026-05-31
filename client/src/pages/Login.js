@@ -74,58 +74,58 @@ const Login = () => {
   };
 
   // ── Phone login via Firebase ───────────────────────────────────
-  const handlePhoneSendOtp = async (e) => {
-    e?.preventDefault();
-    setLoading(true); setError('');
-    try {
-      // Clear old recaptcha
-      if (recaptchaRef.current) {
-        try { recaptchaRef.current.clear(); } catch {}
-        recaptchaRef.current = null;
-      }
-      // Wipe the container div so reCAPTCHA can render fresh
-      const container = document.getElementById('recaptcha-container-login');
-      if (container) container.innerHTML = '';
+  // const handlePhoneSendOtp = async (e) => {
+  //   e?.preventDefault();
+  //   setLoading(true); setError('');
+  //   try {
+  //     // Clear old recaptcha
+  //     if (recaptchaRef.current) {
+  //       try { recaptchaRef.current.clear(); } catch {}
+  //       recaptchaRef.current = null;
+  //     }
+  //     // Wipe the container div so reCAPTCHA can render fresh
+  //     const container = document.getElementById('recaptcha-container-login');
+  //     if (container) container.innerHTML = '';
 
-      recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-login', {
-        size: 'invisible',
-        callback: () => {},
-        'expired-callback': () => { recaptchaRef.current = null; }
-      });
-      await recaptchaRef.current.render();
-      const result = await signInWithPhoneNumber(auth, formData.phone, recaptchaRef.current);
-      setConfirmResult(result);
-      setSuccess(`OTP sent to ${formData.phone}`);
-      setStep(2);
-    } catch (err) {
-      console.error('Firebase OTP error:', err);
-      if (recaptchaRef.current) {
-        try { recaptchaRef.current.clear(); } catch {}
-        recaptchaRef.current = null;
-      }
-      const container = document.getElementById('recaptcha-container-login');
-      if (container) container.innerHTML = '';
-      setError(err?.message || 'Failed to send OTP. Check phone format (+91XXXXXXXXXX)');
-    } finally { setLoading(false); }
-  };
+  //     recaptchaRef.current = new RecaptchaVerifier(auth, 'recaptcha-container-login', {
+  //       size: 'invisible',
+  //       callback: () => {},
+  //       'expired-callback': () => { recaptchaRef.current = null; }
+  //     });
+  //     await recaptchaRef.current.render();
+  //     const result = await signInWithPhoneNumber(auth, formData.phone, recaptchaRef.current);
+  //     setConfirmResult(result);
+  //     setSuccess(`OTP sent to ${formData.phone}`);
+  //     setStep(2);
+  //   } catch (err) {
+  //     console.error('Firebase OTP error:', err);
+  //     if (recaptchaRef.current) {
+  //       try { recaptchaRef.current.clear(); } catch {}
+  //       recaptchaRef.current = null;
+  //     }
+  //     const container = document.getElementById('recaptcha-container-login');
+  //     if (container) container.innerHTML = '';
+  //     setError(err?.message || 'Failed to send OTP. Check phone format (+91XXXXXXXXXX)');
+  //   } finally { setLoading(false); }
+  // };
 
-  const handlePhoneVerifyOtp = async () => {
-    const otpString = otp.join('');
-    if (otpString.length !== 6) return setError('Enter complete 6-digit OTP');
-    setLoading(true); setError('');
-    try {
-      const result    = await confirmResult.confirm(otpString);
-      const token     = await result.user.getIdToken();
-      const { data }  = await axios.post(`${API}/api/auth/phone/firebase-verify`, { firebaseToken: token });
-      if (data.needsUsername) {
-        return setError('No account found. Please sign up first.');
-      }
-      login(data); navigate('/');
-    } catch (err) {
-      setError(err.response?.data?.message || 'Invalid OTP');
-      setOtp(['','','','','','']); otpRefs.current[0]?.focus();
-    } finally { setLoading(false); }
-  };
+  // const handlePhoneVerifyOtp = async () => {
+  //   const otpString = otp.join('');
+  //   if (otpString.length !== 6) return setError('Enter complete 6-digit OTP');
+  //   setLoading(true); setError('');
+  //   try {
+  //     const result    = await confirmResult.confirm(otpString);
+  //     const token     = await result.user.getIdToken();
+  //     const { data }  = await axios.post(`${API}/api/auth/phone/firebase-verify`, { firebaseToken: token });
+  //     if (data.needsUsername) {
+  //       return setError('No account found. Please sign up first.');
+  //     }
+  //     login(data); navigate('/');
+  //   } catch (err) {
+  //     setError(err.response?.data?.message || 'Invalid OTP');
+  //     setOtp(['','','','','','']); otpRefs.current[0]?.focus();
+  //   } finally { setLoading(false); }
+  // };
 
   const OtpBoxes = ({ onVerify }) => (
     <>
