@@ -6,12 +6,17 @@ import axios from 'axios';
 const PlayerBar = () => {
   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
   
-  // Keep refs always pointing to the latest state values to completely avoid stale closures in YouTube callbacks
+  // ── Persistent Reference Hooks ─────────────────────────────────────────
+  // Locks down callbacks to prevent stale state memory closures on lockscreen updates
   const playNextRef = useRef(null);
   const currentSongRef = useRef(null);
+  const shuffleRef = useRef(shuffle);
+  const repeatRef = useRef(repeat);
   
   useEffect(() => { playNextRef.current = playNext; }, [playNext]);
   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
+  useEffect(() => { shuffleRef.current = shuffle; }, [shuffle]);
+  useEffect(() => { repeatRef.current = repeat; }, [repeat]);
 
   // ONE player — always mounted in the modal container, just hidden/shown
   const playerRef     = useRef(null);
@@ -41,10 +46,8 @@ const PlayerBar = () => {
   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
 
   // ── Lyrics ─────────────────────────────────────────────────────────────
-  // ── Detect if text has Devanagari (Hindi) characters ─────────────────
   const hasDevanagari = (text) => /[\u0900-\u097F]/.test(text);
 
-  // ── Transliterate using Claude API ────────────────────────────────────
   const transliterateToHinglish = async (text) => {
     setIsTransliterating(true);
     try {
@@ -70,7 +73,6 @@ const PlayerBar = () => {
     }
   };
 
-  // Parse LRC format "[01:23.45] lyric line" into [{time: seconds, text}]
   const parseSyncedLyrics = (lrc) => {
     if (!lrc) return [];
     return lrc.split('\n')
@@ -91,7 +93,6 @@ const PlayerBar = () => {
     setCurrentLineIndex(0);
     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5;
     try {
-      // ── Clean title aggressively ───────────────────────────────────
       const cleanTitle = song.title
         .replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '')
         .replace(/\|.*/g, '').replace(/ft\.?.*/gi, '')
@@ -106,7 +107,6 @@ const PlayerBar = () => {
         .replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '')
         .replace(/official$/i, '').replace(/music$/i, '').trim();
 
-      // ── Score-based best match finder ──────────────────────────────
       const scoredMatch = (results, targetTitle, targetArtist) => {
         if (!results?.length) return null;
         const t = targetTitle.toLowerCase();
@@ -128,7 +128,6 @@ const PlayerBar = () => {
         return scored[0].score > 0 ? scored[0].result : results[0];
       };
 
-      // ── Extract lyrics from best match ─────────────────────────────
       const processResult = (match) => {
         if (!match) return false;
         if (match.syncedLyrics) {
@@ -139,37 +138,31 @@ const PlayerBar = () => {
         return false;
       };
 
-      // Try 1: aggressive title + artist — pick best match
       let res = await axios.get('https://lrclib.net/api/search', {
         params: { q: `${aggressiveTitle} ${cleanArtist}` }
       });
       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
 
-      // Try 2: aggressive title only
       res = await axios.get('https://lrclib.net/api/search', {
         params: { q: aggressiveTitle }
       });
       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
 
-      // Try 3: clean title + artist
       res = await axios.get('https://lrclib.net/api/search', {
         params: { q: `${cleanTitle} ${cleanArtist}` }
       });
       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
 
-      // Try 4: clean title only
       res = await axios.get('https://lrclib.net/api/search', {
         params: { q: cleanTitle }
       });
       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
 
-      // Try 5: LRCLIB /get with structured params
       res = await axios.get('https://lrclib.net/api/get', {
         params: { track_name: aggressiveTitle, artist_name: cleanArtist }
       });
       if (res.data && processResult(res.data)) return;
 
-      // Try 6: original title as last resort
       res = await axios.get('https://lrclib.net/api/search', {
         params: { q: song.title }
       });
@@ -193,7 +186,6 @@ const PlayerBar = () => {
         const cur   = playerRef.current.getCurrentTime();
         const total = playerRef.current.getDuration();
         if (total > 0) setProgress((cur / total) * 100);
-        // Update synced lyrics line index
         setSyncedLines(prev => {
           if (prev.length === 0) return prev;
           let idx = 0;
@@ -250,7 +242,7 @@ const PlayerBar = () => {
     };
   }, []);
 
-  // Track fullscreen state changes (e.g. user presses Escape key)
+  // Track fullscreen state changes
   useEffect(() => {
     const onChange = () => {
       const full = !!(document.fullscreenElement
@@ -279,8 +271,7 @@ const PlayerBar = () => {
   useEffect(() => {
     if (!currentSong || !window.YT) return;
 
-    // ✅ DIRECT TRACK SWITCH: If the frame is already up, perform a direct injection
-    // instead of destroying the running instance. Prevents initialization timing crashes.
+    // DIRECT TRACK SWITCH: Updates the source frame safely if active
     if (playerRef.current && isReady.current && typeof playerRef.current.loadVideoById === 'function') {
       const activeVideoId = playerRef.current.getVideoData?.()?.video_id;
       if (activeVideoId !== currentSong.youtube_id) {
@@ -304,7 +295,7 @@ const PlayerBar = () => {
         videoId: currentSong.youtube_id,
         playerVars: {
           autoplay: 1,
-          controls: 0,       // we provide our own controls
+          controls: 0,
           disablekb: 1,
           fs: 0,
           iv_load_policy: 3,
@@ -312,26 +303,23 @@ const PlayerBar = () => {
           rel: 0,
           playsinline: 1,
           origin: window.location.origin,
-          vq: 'hd720'        // default quality 720p
+          vq: 'hd720'
         },
         events: {
           onReady: (e) => {
             isReady.current = true;
             e.target.unMute();
             e.target.setVolume(volume);
-            e.target.setPlaybackQuality('hd720'); // force 720p
+            e.target.setPlaybackQuality('hd720');
             e.target.playVideo();
           },
           onStateChange: (e) => {
             if (e.data === window.YT.PlayerState.PLAYING) {
               setIsPlaying(true);
               startProgressTracking();
-              // Ensure quality stays at 720p
               try { e.target.setPlaybackQuality('hd720'); } catch {}
-              // Start silent audio to keep Media Session alive
               silentAudioRef.current?.play().catch(() => {});
               
-              // ✅ Tell OS this is a music player — keeps audio alive on lock screen
               if ('mediaSession' in navigator) {
                 navigator.mediaSession.metadata = new window.MediaMetadata({
                   title:  currentSongRef.current?.title || '',
@@ -341,7 +329,7 @@ const PlayerBar = () => {
                   ]
                 });
                 navigator.mediaSession.playbackState = 'playing';
-                // Lock screen / notification bar controls
+
                 navigator.mediaSession.setActionHandler('play', async () => {
                   silentAudioRef.current?.play().catch(() => {});
                   playerRef.current?.playVideo();
@@ -374,8 +362,6 @@ const PlayerBar = () => {
                 navigator.mediaSession.playbackState = 'paused';
               }
             } else if (e.data === window.YT.PlayerState.ENDED) {
-              // ✅ CONTEXT CLEAN FIX: Don't call playerRef.destroy() early!
-              // Clear progress tracking loops and pass state smoothly to next queue entry.
               stopProgressTracking();
               setProgress(0);
               setIsPlaying(false);
@@ -384,8 +370,13 @@ const PlayerBar = () => {
                 navigator.mediaSession.playbackState = 'paused';
               }
 
-              // Advance queue cleanly
-              if (playNextRef.current) {
+              // ✅ REPEAT ONE TRAP: If repeat context layout is set to 'one', force restart the song loop natively
+              if (repeatRef.current === 'one') {
+                setProgress(0);
+                e.target.seekTo(0, true);
+                e.target.playVideo();
+                setIsPlaying(true);
+              } else if (playNextRef.current) {
                 playNextRef.current();
               }
             }
@@ -465,7 +456,6 @@ const PlayerBar = () => {
     }
   };
 
-  // ── Lyrics renderer ─────────────────────────────────────────────────────
   const renderLyrics = () => {
     if (lyricsLoading) return (
       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
@@ -536,7 +526,7 @@ const PlayerBar = () => {
 
   return (
     <>
-      {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+      {/* ── MODAL CONTAINER ── */}
       <div style={{
         position: 'fixed', inset: 0, zIndex: 2000,
         background: 'rgba(0,0,0,0.96)',
@@ -828,7 +818,7 @@ const PlayerBar = () => {
         )}
       </div>
 
-      {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+      {/* ── PLAYER BAR CONTROLS ── */}
       <div className="player-bar">
         <div className="player-info" style={{ cursor: 'pointer' }}
           onClick={() => { setShowModal(true); setActiveTab('video'); }}>
