@@ -453,8 +453,19 @@ ${text}`
               startProgressTracking();
               acquireWakeLock();
               createMusicControls(currentSong, true);
-              // Play silent audio to keep Media Session notification alive
-              silentAudioRef.current?.play().catch(() => {});
+              // Start silent audio — keeps Media Session notification alive
+              if (silentAudioRef.current) {
+                silentAudioRef.current.play().catch(() => {});
+              } else {
+                // Init silent audio if not yet ready (fallback)
+                try {
+                  const a = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+                  a.loop = true; a.volume = 0.001;
+                  a.addEventListener('pause', () => a.play().catch(()=>{}));
+                  silentAudioRef.current = a;
+                  a.play().catch(() => {});
+                } catch {}
+              }
               // Ensure quality stays at 720p
               try { e.target.setPlaybackQuality('hd720'); } catch {}
               // ✅ Tell OS this is a music player — keeps audio alive on lock screen
@@ -474,19 +485,21 @@ ${text}`
                   playbackRate: 1,
                   position: playerRef.current?.getCurrentTime?.() || 0
                 });
-                // Lock screen controls
-                navigator.mediaSession.setActionHandler('play',           () => { playerRef.current?.playVideo(); setIsPlaying(true); });
-                navigator.mediaSession.setActionHandler('pause',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
-                navigator.mediaSession.setActionHandler('nexttrack',      () => playNextRef.current?.());
-                navigator.mediaSession.setActionHandler('previoustrack',  () => playPrev());
-                navigator.mediaSession.setActionHandler('stop',           () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+                // Lock screen controls — set every time to stay active
+                navigator.mediaSession.setActionHandler('play',     () => { playerRef.current?.playVideo();  setIsPlaying(true);  silentAudioRef.current?.play().catch(()=>{}); });
+                navigator.mediaSession.setActionHandler('pause',    () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+                navigator.mediaSession.setActionHandler('nexttrack',     () => playNextRef.current?.());
+                navigator.mediaSession.setActionHandler('previoustrack', () => playPrev());
+                navigator.mediaSession.setActionHandler('stop',     () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+                navigator.mediaSession.setActionHandler('seekbackward', null);
+                navigator.mediaSession.setActionHandler('seekforward',  null);
               }
             } else if (e.data === window.YT.PlayerState.PAUSED) {
               setIsPlaying(false);
               stopProgressTracking();
               releaseWakeLock();
               MC.updateIsPlaying(false);
-              silentAudioRef.current?.pause();
+              // Keep silent audio running — pausing it kills the notification
               if ('mediaSession' in navigator) {
                 navigator.mediaSession.playbackState = 'paused';
               }
