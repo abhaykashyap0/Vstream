@@ -161,6 +161,763 @@ ${text}`
       res = await axios.get('https://lrclib.net/api/search', {
         params: { q: `${cleanTitle} ${cleanArtist}` }
       });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+
+      // Try 4: clean title only
+      res = await axios.get('https://lrclib.net/api/search', {
+        params: { q: cleanTitle }
+      });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+
+      // Try 5: LRCLIB /get with structured params
+      res = await axios.get('https://lrclib.net/api/get', {
+        params: { track_name: aggressiveTitle, artist_name: cleanArtist }
+      });
+      if (res.data && processResult(res.data)) return;
+
+      // Try 6: original title as last resort
+      res = await axios.get('https://lrclib.net/api/search', {
+        params: { q: song.title }
+      });
+      if (res.data?.length > 0 && processResult(scoredMatch(res.data, song.title, cleanArtist))) return;
+
+      setPlainLyrics('Lyrics not found for this song.');
+    } catch {
+      setPlainLyrics('Could not load lyrics. Please try again.');
+    } finally {
+      setLyricsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+  // ── Progress ────────────────────────────────────────────────────────────
+  const startProgressTracking = () => {
+    stopProgressTracking();
+    progressInterval.current = setInterval(() => {
+      if (playerRef.current?.getCurrentTime) {
+        const cur   = playerRef.current.getCurrentTime();
+        const total = playerRef.current.getDuration();
+        if (total > 0) setProgress((cur / total) * 100);
+        // Update synced lyrics line index
+        setSyncedLines(prev => {
+          if (prev.length === 0) return prev;
+          let idx = 0;
+          for (let i = 0; i < prev.length; i++) {
+            if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i;
+            else break;
+          }
+          setCurrentLineIndex(idx);
+          return prev;
+        });
+      }
+    }, 300);
+  };
+  const stopProgressTracking = () => {
+    if (progressInterval.current) {
+      clearInterval(progressInterval.current);
+      progressInterval.current = null;
+    }
+  };
+  useEffect(() => () => stopProgressTracking(), []);
+
+  // ── Genuine Audio File Anchor — Keeps system background thread open ─────
+  useEffect(() => {
+    const audio = new Audio('/silence.mp3');
+    audio.loop = true;
+    audio.volume = 0.01; // Tiny volume to prevent OS from cutting it off
+    silentAudioRef.current = audio;
+    return () => { audio.pause(); };
+  }, []);
+
+  // ── Resume on screen unlock / tab focus ───────────────────────────────
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        if (isPlaying) {
+          silentAudioRef.current?.play().catch(() => {});
+        }
+        setTimeout(() => {
+          try {
+            if (playerRef.current && isReady.current) {
+              const s = playerRef.current.getPlayerState?.();
+              if (s === 2 || s === -1) playerRef.current.playVideo();
+            }
+          } catch {}
+        }, 300);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    window.addEventListener('pageshow', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+      window.removeEventListener('pageshow', onVisible);
+    };
+  }, [isPlaying]);
+
+  // Track fullscreen state changes (e.g. user presses Escape key)
+  useEffect(() => {
+    const onChange = () => {
+      const full = !!(document.fullscreenElement
+        || document.webkitFullscreenElement
+        || document.mozFullScreenElement
+        || document.msFullscreenElement);
+      setIsFullscreen(full);
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
+  }, []);
+
+  // ── Load YouTube IFrame API once ────────────────────────────────────────
+  useEffect(() => {
+    if (window.YT) return;
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.body.appendChild(tag);
+  }, []);
+
+  // ── Create / reload player when song changes ────────────────────────────
+  useEffect(() => {
+    if (!currentSong) return;
+
+    const initPlayer = () => {
+      // Destroy old player cleanly
+      if (playerRef.current) {
+        try { playerRef.current.destroy(); } catch {}
+        playerRef.current = null;
+        isReady.current = false;
+      }
+
+      playerRef.current = new window.YT.Player(playerContRef.current, {
+        videoId: currentSong.youtube_id,
+        playerVars: {
+          autoplay: 1,
+          controls: 0,       // we provide our own controls
+          disablekb: 1,
+          fs: 0,
+          iv_load_policy: 3,
+          modestbranding: 1,
+          rel: 0,
+          playsinline: 1,
+          origin: window.location.origin,
+          vq: 'hd720'        // default quality 720p
+        },
+        events: {
+          onReady: (e) => {
+            isReady.current = true;
+            e.target.unMute();
+            e.target.setVolume(volume);
+            e.target.setPlaybackQuality('hd720'); // force 720p
+            if (isPlaying) e.target.playVideo();
+          },
+          onStateChange: (e) => {
+            if (e.data === window.YT.PlayerState.PLAYING) {
+              setIsPlaying(true);
+              startProgressTracking();
+              
+              try { e.target.setPlaybackQuality('hd720'); } catch {}
+              silentAudioRef.current?.play().catch(() => {});
+              
+              if ('mediaSession' in navigator) {
+                navigator.mediaSession.metadata = new window.MediaMetadata({
+                  title:  currentSong.title,
+                  artist: currentSong.artist,
+                  artwork: [
+                    { src: currentSong.image_url, sizes: '512x512', type: 'image/jpeg' }
+                  ]
+                });
+                navigator.mediaSession.playbackState = 'playing';
+                
+                navigator.mediaSession.setActionHandler('play', async () => {
+                  try {
+                    if (silentAudioRef.current) await silentAudioRef.current.play();
+                    e.target.playVideo(); 
+                    setIsPlaying(true);
+                    navigator.mediaSession.playbackState = 'playing';
+                  } catch (err) { console.error("Lockscreen resume error:", err); }
+                });
+                
+                navigator.mediaSession.setActionHandler('pause', () => {
+                  e.target.pauseVideo(); 
+                  if (silentAudioRef.current) silentAudioRef.current.pause();
+                  setIsPlaying(false);
+                  navigator.mediaSession.playbackState = 'paused';
+                });
+
+                navigator.mediaSession.setActionHandler('nexttrack', async () => {
+                  if (silentAudioRef.current) silentAudioRef.current.pause();
+                  playNextRef.current?.();
+                });
+                
+                navigator.mediaSession.setActionHandler('previoustrack', async () => {
+                  if (silentAudioRef.current) silentAudioRef.current.pause();
+                  playPrev();
+                });
+                
+                navigator.mediaSession.setActionHandler('stop', () => {
+                  e.target.pauseVideo();
+                  if (silentAudioRef.current) silentAudioRef.current.pause();
+                  setIsPlaying(false);
+                  navigator.mediaSession.playbackState = 'paused';
+                });
+              }
+            } else if (e.data === window.YT.PlayerState.PAUSED) {
+              setIsPlaying(false);
+              stopProgressTracking();
+              silentAudioRef.current?.pause();
+              if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'paused';
+              }
+            } else if (e.data === window.YT.PlayerState.ENDED) {
+              // ✅ FIX: Keep player container mounted to let next track lifecycle run smoothly
+              stopProgressTracking();
+              setProgress(0);
+              setIsPlaying(false);
+              silentAudioRef.current?.pause();
+              
+              if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'paused';
+              }
+
+              if (playNextRef.current) {
+                playNextRef.current();
+              }
+            }
+          },
+          onError: (e) => {
+            if (e.data === 101 || e.data === 150) playNextRef.current?.();
+            else setIsPlaying(false);
+          }
+        }
+      });
+    };
+
+    if (window.YT?.Player) initPlayer();
+    else window.onYouTubeIframeAPIReady = initPlayer;
+  }, [songKey]); // eslint-disable-line
+
+  // ── Play / pause handler updates ─────────────────────────────────────────
+  useEffect(() => {
+    if (!playerRef.current || !isReady.current) return;
+    if (isPlaying) {
+      playerRef.current.unMute();
+      playerRef.current.setVolume(volume);
+      playerRef.current.playVideo();
+      silentAudioRef.current?.play().catch(() => {});
+    } else {
+      playerRef.current.pauseVideo();
+      silentAudioRef.current?.pause();
+    }
+  }, [isPlaying]); // eslint-disable-line
+
+  // ── Controls ────────────────────────────────────────────────────────────
+  const handleSeek = (e) => {
+    if (!playerRef.current || !isReady.current) return;
+    const clickX = e.nativeEvent.offsetX;
+    const width  = e.currentTarget.offsetWidth;
+    const total  = playerRef.current.getDuration();
+    if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+  };
+
+  const handleVolumeChange = (e) => {
+    const val = parseInt(e.target.value);
+    setVolume(val);
+    if (playerRef.current && isReady.current) {
+      playerRef.current.setVolume(val);
+      if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+      else           { playerRef.current.unMute(); setIsMuted(false); }
+    }
+  };
+
+  const toggleMute = () => {
+    if (!playerRef.current || !isReady.current) return;
+    if (isMuted) {
+      playerRef.current.unMute();
+      playerRef.current.setVolume(volume || 100);
+      setIsMuted(false);
+    } else {
+      playerRef.current.mute();
+      setIsMuted(true);
+    }
+  };
+
+  const handleFullscreen = () => {
+    const el = videoWrapperRef.current;
+    if (!el) return;
+    const isFull = document.fullscreenElement
+      || document.webkitFullscreenElement
+      || document.mozFullScreenElement
+      || document.msFullscreenElement;
+    if (isFull) {
+      if (document.exitFullscreen) document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+      else if (document.msExitFullscreen) document.msExitFullscreen();
+    } else {
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+      else if (el.msRequestFullscreen) el.msRequestFullscreen();
+    }
+  };
+
+  // ── Lyrics renderer ─────────────────────────────────────────────────────
+  const renderLyrics = () => {
+    if (lyricsLoading) return (
+      <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+        <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+        <div>Loading lyrics...</div>
+      </div>
+    );
+
+    if (syncedLines.length > 0) {
+      const startIdx = Math.max(0, currentLineIndex - 1);
+      const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+
+      return (
+        <div style={{
+          display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'center',
+          height: '100%', gap: '18px', padding: '20px'
+        }}>
+          {visibleLines.map((line, i) => {
+            const globalIndex = startIdx + i;
+            const isCurrent = globalIndex === currentLineIndex;
+            const isNext = globalIndex === currentLineIndex + 1;
+            const isPast = globalIndex < currentLineIndex;
+            return (
+              <div key={globalIndex} style={{
+                textAlign: 'center',
+                fontSize: isCurrent ? '1.5rem' : '1.1rem',
+                fontWeight: isCurrent ? 'bold' : 'normal',
+                color: isCurrent ? '#1db954'
+                     : isNext    ? '#ffffff'
+                     : isPast    ? '#555'
+                     : '#888',
+                transition: 'all 0.3s ease',
+                lineHeight: '1.5',
+                opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+                transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+              }}>
+                {line.text || ' '}
+              </div>
+            );
+          })}
+          <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+            {currentLineIndex + 1} / {syncedLines.length}
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div style={{ padding: '10px 20px', textAlign: 'center' }}>
+        {plainLyrics.split('\n').map((line, i) => (
+          <p key={i} style={{
+            margin: '0',
+            color: line.trim() ? '#ddd' : 'transparent',
+            fontSize: 'clamp(0.88rem, 2.5vw, 1rem)',
+            lineHeight: '2',
+            minHeight: '2rem',
+            fontWeight: line.trim() ? '400' : 'normal'
+          }}>
+            {line.trim() || '\u00a0'}
+          </p>
+        ))}
+      </div>
+    );
+  };
+
+  if (!currentSong) return null;
+
+  return (
+    <>
+      {/* ── MODAL (always rendered so player iframe is never unmounted) ── */}
+      <div style={{
+        position: 'fixed', inset: 0, zIndex: 2000,
+        background: 'rgba(0,0,0,0.96)',
+        display: 'flex', flexDirection: 'column',
+        visibility: showModal ? 'visible' : 'hidden',
+        pointerEvents: showModal ? 'all' : 'none'
+      }}>
+        {/* Header */}
+        <div style={{
+          display: 'flex', alignItems: 'center',
+          padding: '10px 14px', borderBottom: '1px solid #333',
+          gap: '10px', flexWrap: 'nowrap', minWidth: 0
+        }}>
+          <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+            <div style={{
+              fontWeight: 'bold',
+              fontSize: 'clamp(0.82rem, 2.5vw, 1rem)',
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+            }}>{currentSong.title}</div>
+            <div style={{
+              color: '#b3b3b3',
+              fontSize: 'clamp(0.72rem, 2vw, 0.85rem)',
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+            }}>{currentSong.artist}</div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+            {['video', 'lyrics'].map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)} style={{
+                padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+                background: activeTab === tab ? '#1db954' : '#333',
+                color: 'white', display: 'flex', alignItems: 'center', gap: '5px',
+                fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap'
+              }}>
+                {tab === 'video' ? <Tv size={13} /> : <Music size={13} />}
+                <span style={{ display: 'var(--tab-label-display, inline)' }}>
+                  {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                </span>
+              </button>
+            ))}
+          </div>
+
+          <button onClick={() => setShowModal(false)} style={{
+            background: '#333', border: 'none', borderRadius: '50%',
+            width: '32px', height: '32px', flexShrink: 0,
+            cursor: 'pointer', display: 'flex',
+            alignItems: 'center', justifyContent: 'center', color: 'white'
+          }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Content area */}
+        <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+          {/* VIDEO TAB */}
+          <div style={{
+            display: activeTab === 'video' ? 'flex' : 'none',
+            flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+          }}>
+            <div ref={videoWrapperRef} style={{
+              width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+              borderRadius: '12px', overflow: 'hidden',
+              position: 'relative', background: '#000'
+            }}>
+              <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+              <div
+                style={{
+                  position: 'absolute', inset: 0,
+                  zIndex: 20,
+                  background: 'transparent',
+                  cursor: 'default'
+                }}
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                }}
+              />
+
+              <div style={{
+                position: 'absolute', top: 0, left: 0, right: 0,
+                height: '60px',
+                background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+                zIndex: 30,
+                pointerEvents: 'none'
+              }} />
+
+              {/* Custom controls overlay */}
+              <div style={{
+                position: 'absolute', bottom: 0, left: 0, right: 0,
+                padding: '50px 16px 12px',
+                background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+                zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+              }}>
+                <div onClick={handleSeek} style={{
+                  width: '100%', height: '4px',
+                  background: 'rgba(255,255,255,0.3)',
+                  borderRadius: '2px', cursor: 'pointer'
+                }}>
+                  <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                    <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+                      style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+                      onClick={() => hasPrev && playPrev()} />
+                    <button onClick={togglePlay} style={{
+                      background: 'white', border: 'none', borderRadius: '50%',
+                      width: '36px', height: '36px',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+                    }}>
+                      {isPlaying
+                        ? <Pause size={18} color="black" />
+                        : <Play  size={18} color="black" fill="black" />}
+                    </button>
+                    <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+                      style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+                      onClick={() => hasNext && playNext()} />
+                    <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+                      {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+                    </div>
+                    <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+                      onChange={handleVolumeChange}
+                      style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+                  </div>
+                  <button onClick={handleFullscreen} style={{
+                    background: 'transparent', border: 'none',
+                    cursor: 'pointer', color: 'white',
+                    display: 'flex', alignItems: 'center', gap: '4px'
+                  }}>
+                    {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* LYRICS TAB */}
+          {activeTab === 'lyrics' && (
+            <div style={{
+              flex: 1, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center',
+              padding: '20px', overflow: 'hidden'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px', width: '100%', maxWidth: '600px' }}>
+                <img src={currentSong.image_url} alt={currentSong.title}
+                  style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 'bold', fontSize: 'clamp(0.85rem, 2.5vw, 1rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
+                  <div style={{ color: '#b3b3b3', fontSize: '0.82rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
+                </div>
+                {(syncedLines.some(l => hasDevanagari(l.text)) || hasDevanagari(plainLyrics)) && (
+                  <button
+                    onClick={async () => {
+                      if (translitMode === 'original') {
+                        setTranslitMode('loading');
+                        const lyricsText = syncedLines.length > 0
+                          ? syncedLines.map(l => l.text).join('\n')
+                          : plainLyrics;
+                        const result = await transliterateToHinglish(lyricsText);
+                        const lines = result.split('\n');
+                        if (syncedLines.length > 0) {
+                          setSyncedLines(prev => prev.map((l, i) => ({ ...l, text: lines[i] || l.text })));
+                        } else {
+                          setPlainLyrics(result);
+                        }
+                        setTranslitMode('hinglish');
+                      } else if (translitMode === 'hinglish') {
+                        fetchLyrics(currentSong);
+                        setTranslitMode('original');
+                      }
+                    }}
+                    disabled={translitMode === 'loading'}
+                    style={{
+                      flexShrink: 0,
+                      padding: '6px 12px', borderRadius: '20px', border: 'none',
+                      cursor: translitMode === 'loading' ? 'wait' : 'pointer',
+                      background: translitMode === 'hinglish' ? '#1db954' : '#333',
+                      color: 'white', fontSize: '0.75rem', fontWeight: 600,
+                      whiteSpace: 'nowrap'
+                    }}
+                  >
+                    {translitMode === 'loading' ? '...' : translitMode === 'hinglish' ? 'अ Original' : 'A Hinglish'}
+                  </button>
+                )}
+              </div>
+
+              {syncedLines.length > 0 && (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: '10px',
+                  marginBottom: '20px', background: '#1e1e1e',
+                  borderRadius: '20px', padding: '6px 14px'
+                }}>
+                  <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+                  <button
+                    onClick={() => setLyricsOffset(prev => {
+                      const v = Math.round((prev - 0.5) * 10) / 10;
+                      lyricsOffsetRef.current = v; return v;
+                    })}
+                    style={{
+                      background: '#333', border: 'none', borderRadius: '50%',
+                      width: '26px', height: '26px', cursor: 'pointer',
+                      color: 'white', fontSize: '16px', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center'
+                    }}
+                  >−</button>
+                  <span style={{
+                    color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+                    fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+                  }}>
+                    {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+                  </span>
+                  <button
+                    onClick={() => setLyricsOffset(prev => {
+                      const v = Math.round((prev + 0.5) * 10) / 10;
+                      lyricsOffsetRef.current = v; return v;
+                    })}
+                    style={{
+                      background: '#333', border: 'none', borderRadius: '50%',
+                      width: '26px', height: '26px', cursor: 'pointer',
+                      color: 'white', fontSize: '16px', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center'
+                    }}
+                  >+</button>
+                  {lyricsOffset !== 1.5 && (
+                    <button
+                      onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+                      style={{
+                        background: 'transparent', border: 'none',
+                        color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+                      }}
+                    >Reset</button>
+                  )}
+                </div>
+              )}
+              <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {renderLyrics()}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Lyrics tab footer controls */}
+        {activeTab === 'lyrics' && (
+          <div style={{
+            padding: '12px 24px 20px', borderTop: '1px solid #333',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+              <Shuffle size={18} onClick={toggleShuffle}
+                style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+              <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+                style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+                onClick={() => hasPrev && playPrev()} />
+              <button onClick={togglePlay} style={{
+                background: 'white', border: 'none', borderRadius: '50%',
+                width: '48px', height: '48px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+              }}>
+                {isPlaying
+                  ? <Pause size={26} color="black" />
+                  : <Play  size={26} color="black" fill="black" />}
+              </button>
+              <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+                style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+                onClick={() => hasNext && playNext()} />
+              <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+                {repeat === 'one'
+                  ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+                  : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+                {repeat !== 'none' && (
+                  <div style={{
+                    position: 'absolute', bottom: '-4px', left: '50%',
+                    transform: 'translateX(-50%)',
+                    width: '4px', height: '4px',
+                    borderRadius: '50%', background: '#1db954'
+                  }} />
+                )}
+              </div>
+            </div>
+            <div onClick={handleSeek} style={{
+              width: '60%', height: '4px', background: '#444',
+              borderRadius: '2px', cursor: 'pointer'
+            }}>
+              <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+      <div className="player-bar">
+
+        <div className="player-info" style={{ cursor: 'pointer' }}
+          onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+          <div style={{ position: 'relative' }}>
+            <img src={currentSong.image_url} alt={currentSong.title} />
+            <div style={{
+              position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+            }}
+              onMouseEnter={e => e.currentTarget.style.opacity = 1}
+              onMouseLeave={e => e.currentTarget.style.opacity = 0}
+            >
+              <Tv size={20} color="white" />
+            </div>
+          </div>
+          <div>
+            <div className="song-title">{currentSong.title}</div>
+            <div className="song-artist">{currentSong.artist}</div>
+            {queue.length > 0 && currentIndex >= 0 && (
+              <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+                {currentIndex + 1} / {queue.length} in playlist
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="player-controls">
+          <div className="control-buttons">
+            <Shuffle
+              size={15}
+              onClick={toggleShuffle}
+              style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3', flexShrink: 0 }}
+            />
+            <SkipBack size={16} fill={hasPrev ? 'white' : '#555'}
+              style={{ cursor: hasPrev ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+              onClick={() => hasPrev && playPrev()} />
+            <button onClick={togglePlay} style={{
+              background: 'white', border: 'none', borderRadius: '50%',
+              width: '34px', height: '34px', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+            }}>
+              {isPlaying
+                ? <Pause size={18} color="black" />
+                : <Play  size={18} color="black" fill="black" />}
+            </button>
+            <SkipForward size={16} fill={hasNext ? 'white' : '#555'}
+              style={{ cursor: hasNext ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+              onClick={() => hasNext && playNext()} />
+            <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+              {repeat === 'one'
+                ? <Repeat1 size={15} style={{ color: '#1db954' }} />
+                : <Repeat  size={15} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+              }
+              {repeat !== 'none' && (
+                <div style={{
+                  position: 'absolute', bottom: '-4px', left: '50%',
+                  transform: 'translateX(-50%)',
+                  width: '4px', height: '4px',
+                  borderRadius: '50%', background: '#1db954'
+                }} />
+              )}
+            </div>
+          </div>
+          <div onClick={handleSeek} style={{
+            width: '100%', height: '4px', background: '#444',
+            borderRadius: '2px', cursor: 'pointer', position: 'relative'
+          }}>
+            <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+          </div>
+        </div>
+
+        <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+          <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+            {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+          </div>
+          <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+            onChange={handleVolumeChange}
+            style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+        </div>
+      </div>
+    </>
+  );
+};
+
+export default PlayerBar;
 
 
 // gemini play next in laptop
