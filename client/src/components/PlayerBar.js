@@ -597,7 +597,327 @@ ${text}`
           {/* VIDEO TAB */}
           <div style={{
             display: activeTab === 'video' ? 'flex' : 'none',
-            flex:
+            flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px'
+          }}>
+            <div ref={videoWrapperRef} style={{
+              width: '100%', maxWidth: '900px', aspectRatio: '16/9',
+              borderRadius: '12px', overflow: 'hidden',
+              position: 'relative', background: '#000'
+            }}>
+              <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+              <div
+                style={{
+                  position: 'absolute', inset: 0,
+                  zIndex: 20,
+                  background: 'transparent',
+                  cursor: 'default'
+                }}
+                onMouseDown={(e) => {
+                  e.stopPropagation();
+                }}
+              />
+
+              <div style={{
+                position: 'absolute', top: 0, left: 0, right: 0,
+                height: '60px',
+                background: 'linear-gradient(rgba(0,0,0,0.85), transparent)',
+                zIndex: 30,
+                pointerEvents: 'none'
+              }} />
+
+              {/* Custom controls overlay */}
+              <div style={{
+                position: 'absolute', bottom: 0, left: 0, right: 0,
+                padding: '50px 16px 12px',
+                background: 'linear-gradient(transparent, rgba(0,0,0,0.9))',
+                zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px'
+              }}>
+                <div onClick={handleSeek} style={{
+                  width: '100%', height: '4px',
+                  background: 'rgba(255,255,255,0.3)',
+                  borderRadius: '2px', cursor: 'pointer'
+                }}>
+                  <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+                    <SkipBack size={18} fill={hasPrev ? 'white' : '#555'}
+                      style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+                      onClick={() => hasPrev && playPrev()} />
+                    <button onClick={togglePlay} style={{
+                      background: 'white', border: 'none', borderRadius: '50%',
+                      width: '36px', height: '36px',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+                    }}>
+                      {isPlaying
+                        ? <Pause size={18} color="black" />
+                        : <Play  size={18} color="black" fill="black" />}
+                    </button>
+                    <SkipForward size={18} fill={hasNext ? 'white' : '#555'}
+                      style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+                      onClick={() => hasNext && playNext()} />
+                    <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+                      {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+                    </div>
+                    <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+                      onChange={handleVolumeChange}
+                      style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+                  </div>
+                  <button onClick={handleFullscreen} style={{
+                    background: 'transparent', border: 'none',
+                    cursor: 'pointer', color: 'white',
+                    display: 'flex', alignItems: 'center', gap: '4px'
+                  }}>
+                    {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* LYRICS TAB */}
+          {activeTab === 'lyrics' && (
+            <div style={{
+              flex: 1, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center',
+              padding: '20px', overflow: 'hidden'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px', width: '100%', maxWidth: '600px' }}>
+                <img src={currentSong.image_url} alt={currentSong.title}
+                  style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 'bold', fontSize: 'clamp(0.85rem, 2.5vw, 1rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
+                  <div style={{ color: '#b3b3b3', fontSize: '0.82rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
+                </div>
+                {(syncedLines.some(l => hasDevanagari(l.text)) || hasDevanagari(plainLyrics)) && (
+                  <button
+                    onClick={async () => {
+                      if (translitMode === 'original') {
+                        setTranslitMode('loading');
+                        const lyricsText = syncedLines.length > 0
+                          ? syncedLines.map(l => l.text).join('\n')
+                          : plainLyrics;
+                        const result = await transliterateToHinglish(lyricsText);
+                        const lines = result.split('\n');
+                        if (syncedLines.length > 0) {
+                          setSyncedLines(prev => prev.map((l, i) => ({ ...l, text: lines[i] || l.text })));
+                        } else {
+                          setPlainLyrics(result);
+                        }
+                        setTranslitMode('hinglish');
+                      } else if (translitMode === 'hinglish') {
+                        fetchLyrics(currentSong);
+                        setTranslitMode('original');
+                      }
+                    }}
+                    disabled={translitMode === 'loading'}
+                    style={{
+                      flexShrink: 0,
+                      padding: '6px 12px', borderRadius: '20px', border: 'none',
+                      cursor: translitMode === 'loading' ? 'wait' : 'pointer',
+                      background: translitMode === 'hinglish' ? '#1db954' : '#333',
+                      color: 'white', fontSize: '0.75rem', fontWeight: 600,
+                      whiteSpace: 'nowrap'
+                    }}
+                  >
+                    {translitMode === 'loading' ? '...' : translitMode === 'hinglish' ? 'अ Original' : 'A Hinglish'}
+                  </button>
+                )}
+              </div>
+
+              {syncedLines.length > 0 && (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: '10px',
+                  marginBottom: '20px', background: '#1e1e1e',
+                  borderRadius: '20px', padding: '6px 14px'
+                }}>
+                  <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+                  <button
+                    onClick={() => setLyricsOffset(prev => {
+                      const v = Math.round((prev - 0.5) * 10) / 10;
+                      lyricsOffsetRef.current = v; return v;
+                    })}
+                    style={{
+                      background: '#333', border: 'none', borderRadius: '50%',
+                      width: '26px', height: '26px', cursor: 'pointer',
+                      color: 'white', fontSize: '16px', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center'
+                    }}
+                  >−</button>
+                  <span style={{
+                    color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954',
+                    fontSize: '0.82rem', minWidth: '48px', textAlign: 'center'
+                  }}>
+                    {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+                  </span>
+                  <button
+                    onClick={() => setLyricsOffset(prev => {
+                      const v = Math.round((prev + 0.5) * 10) / 10;
+                      lyricsOffsetRef.current = v; return v;
+                    })}
+                    style={{
+                      background: '#333', border: 'none', borderRadius: '50%',
+                      width: '26px', height: '26px', cursor: 'pointer',
+                      color: 'white', fontSize: '16px', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center'
+                    }}
+                  >+</button>
+                  {lyricsOffset !== 1.5 && (
+                    <button
+                      onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }}
+                      style={{
+                        background: 'transparent', border: 'none',
+                        color: '#666', cursor: 'pointer', fontSize: '0.75rem'
+                      }}
+                    >Reset</button>
+                  )}
+                </div>
+              )}
+              <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {renderLyrics()}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Lyrics tab footer controls */}
+        {activeTab === 'lyrics' && (
+          <div style={{
+            padding: '12px 24px 20px', borderTop: '1px solid #333',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+              <Shuffle size={18} onClick={toggleShuffle}
+                style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+              <SkipBack size={22} fill={hasPrev ? 'white' : '#555'}
+                style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }}
+                onClick={() => hasPrev && playPrev()} />
+              <button onClick={togglePlay} style={{
+                background: 'white', border: 'none', borderRadius: '50%',
+                width: '48px', height: '48px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+              }}>
+                {isPlaying
+                  ? <Pause size={26} color="black" />
+                  : <Play  size={26} color="black" fill="black" />}
+              </button>
+              <SkipForward size={22} fill={hasNext ? 'white' : '#555'}
+                style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }}
+                onClick={() => hasNext && playNext()} />
+              <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+                {repeat === 'one'
+                  ? <Repeat1 size={18} style={{ color: '#1db954' }} />
+                  : <Repeat  size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+                {repeat !== 'none' && (
+                  <div style={{
+                    position: 'absolute', bottom: '-4px', left: '50%',
+                    transform: 'translateX(-50%)',
+                    width: '4px', height: '4px',
+                    borderRadius: '50%', background: '#1db954'
+                  }} />
+                )}
+              </div>
+            </div>
+            <div onClick={handleSeek} style={{
+              width: '60%', height: '4px', background: '#444',
+              borderRadius: '2px', cursor: 'pointer'
+            }}>
+              <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── PLAYER BAR ──────────────────────────────────────────────── */}
+      <div className="player-bar">
+
+        <div className="player-info" style={{ cursor: 'pointer' }}
+          onClick={() => { setShowModal(true); setActiveTab('video'); }}>
+          <div style={{ position: 'relative' }}>
+            <img src={currentSong.image_url} alt={currentSong.title} />
+            <div style={{
+              position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s'
+            }}
+              onMouseEnter={e => e.currentTarget.style.opacity = 1}
+              onMouseLeave={e => e.currentTarget.style.opacity = 0}
+            >
+              <Tv size={20} color="white" />
+            </div>
+          </div>
+          <div>
+            <div className="song-title">{currentSong.title}</div>
+            <div className="song-artist">{currentSong.artist}</div>
+            {queue.length > 0 && currentIndex >= 0 && (
+              <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>
+                {currentIndex + 1} / {queue.length} in playlist
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="player-controls">
+          <div className="control-buttons">
+            <Shuffle
+              size={15}
+              onClick={toggleShuffle}
+              style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3', flexShrink: 0 }}
+            />
+            <SkipBack size={16} fill={hasPrev ? 'white' : '#555'}
+              style={{ cursor: hasPrev ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+              onClick={() => hasPrev && playPrev()} />
+            <button onClick={togglePlay} style={{
+              background: 'white', border: 'none', borderRadius: '50%',
+              width: '34px', height: '34px', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer'
+            }}>
+              {isPlaying
+                ? <Pause size={18} color="black" />
+                : <Play  size={18} color="black" fill="black" />}
+            </button>
+            <SkipForward size={16} fill={hasNext ? 'white' : '#555'}
+              style={{ cursor: hasNext ? 'pointer' : 'not-allowed', flexShrink: 0 }}
+              onClick={() => hasNext && playNext()} />
+            <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+              {repeat === 'one'
+                ? <Repeat1 size={15} style={{ color: '#1db954' }} />
+                : <Repeat  size={15} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />
+              }
+              {repeat !== 'none' && (
+                <div style={{
+                  position: 'absolute', bottom: '-4px', left: '50%',
+                  transform: 'translateX(-50%)',
+                  width: '4px', height: '4px',
+                  borderRadius: '50%', background: '#1db954'
+                }} />
+              )}
+            </div>
+          </div>
+          <div onClick={handleSeek} style={{
+            width: '100%', height: '4px', background: '#444',
+            borderRadius: '2px', cursor: 'pointer', position: 'relative'
+          }}>
+            <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+          </div>
+        </div>
+
+        <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+          <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+            {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+          </div>
+          <input type="range" min="0" max="100" value={isMuted ? 0 : volume}
+            onChange={handleVolumeChange}
+            style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+        </div>
+      </div>
+    </>
+  );
+};
+
+export default PlayerBar;
 
 
 
