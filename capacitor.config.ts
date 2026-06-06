@@ -4,16 +4,9 @@ const config: CapacitorConfig = {
   appId: 'com.vstream.app',
   appName: 'VStream',
   webDir: 'client/build',
-  android: {
-    allowMixedContent: true,
-    captureInput: true,
-    webContentsDebuggingEnabled: false,
-    backgroundColor: '#000000',
-  },
-  plugins: {
-    CapacitorHttp: {
-      enabled: true
-    }
+  server: {
+    url: 'https://vstream-black.vercel.app',
+    cleartext: true
   }
 };
 
