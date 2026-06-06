@@ -342,14 +342,13 @@ ${text}`
                 isReady.current = false;
               } catch {}
 
-              const useRepeat = playNextRef.current;
+              const goNext = playNextRef.current;
               if (repeat === 'one') {
-                // Replay same song — trigger via songKey change in MusicContext
-                useRepeat?.();
+                goNext?.();
               } else if (repeat === 'all') {
-                useRepeat?.();
+                goNext?.();
               } else if (hasNext) {
-                useRepeat?.();
+                goNext?.();
               }
               // If no next and no repeat — stay stopped
             }
