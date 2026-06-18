@@ -1,17 +1,32 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import youtubeDl from 'youtube-dl-exec'; // 👈 CRITICAL: Added Wrapper Import
+import youtubeDl from 'youtube-dl-exec'; // ── Native Audio Extractor Engine ──
+
+// ── 1. IMPORT YOUR ROUTE MODULES ─────────────────────────────────────
+import authRoutes from './routes/authRoutes.js';
+import searchRoutes from './routes/searchRoutes.js';
+import playlistRoutes from './routes/playlistRoutes.js';
 
 dotenv.config();
 const app = express();
 
+// ── 2. GLOBAL MIDDLEWARE ──────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ... Keep your existing MongoDB connections, models, and other middleware endpoints here ...
+// ── 3. DATABASE CONFIGURATION ─────────────────────────────────────────
+mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/vstream')
+  .then(() => console.log('MongoDB cluster connected successfully'))
+  .catch((err) => console.error('Database connection critical failure:', err));
 
-// ── NATIVE MOBILE AUDIO BACKGROUND STREAM BRIDGE ──────────────────────
+// ── 4. PRODUCTION API ROUTE MOUNTS ────────────────────────────────────
+app.use('/api/auth', authRoutes);
+app.use('/api/search', searchRoutes); // 👈 Fixed the 404 error by mounting this cleanly
+app.use('/api/playlists', playlistRoutes);
+
+// ── 5. NATIVE MOBILE AUDIO BACKGROUND STREAM BRIDGE ──────────────────────
 app.get('/api/songs/stream/:youtubeId', async (req, res) => {
   const { youtubeId } = req.params;
 
@@ -20,28 +35,33 @@ app.get('/api/songs/stream/:youtubeId', async (req, res) => {
   }
 
   try {
-    // Calls the extraction sub-engine to grab the absolute best native background audio track stream URL
+    // Queries yt-dlp to extract the raw, optimized background audio track stream URL from YouTube
     const output = await youtubeDl(`https://www.youtube.com/watch?v=${youtubeId}`, {
       getUrl: true,
-      format: 'bestaudio[ext=m4a]/bestaudio', // Force high-fidelity, data-friendly compressed audio tracks
+      format: 'bestaudio[ext=m4a]/bestaudio', // Targets high-efficiency, compressed mobile audio layers
     });
 
     const directAudioStreamUrl = output.trim();
 
-    // 🚀 THE FIX: Perform an HTTP 302 redirect directly into the raw audio stream location.
-    // This tells mobile phone kernels (iOS & Android) that this is native audio, NOT a video.
+    // 🚀 THE UX FIX: Perform an HTTP 302 redirect directly into the raw audio binary stream.
+    // This tricks mobile OS kernels (iOS & Android) into thinking it's a native audio player,
+    // keeping background progression awake on mobile browsers WITHOUT forcing "Request Desktop Site".
     res.redirect(directAudioStreamUrl);
   } catch (error) {
     console.error('Mobile background audio stream bridge failure:', error);
-    res.status(500).json({ error: 'Could not resolve backend background streaming media binary channel' });
+    res.status(500).json({ error: 'Could not resolve backend background streaming media channel' });
   }
 });
 
-// ... Keep your existing api routing links below like app.use('/api/users', ...) ...
+// ── 6. APPLICATION SYSTEM HEALTH CHECK ────────────────────────────────
+app.get('/', (req, res) => {
+  res.status(200).json({ status: 'active', message: 'VSTREAM production API engine running' });
+});
 
+// ── 7. SERVER PORT BINDING AND INITIALIZATION ────────────────────────
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`VSTREAM Server cluster initializing on port ${PORT}`);
+  console.log(`VSTREAM Server cluster initializing securely on port ${PORT}`);
 });
 
 
