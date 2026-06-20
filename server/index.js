@@ -1,133 +1,64 @@
-import express from 'express';
-import mongoose from 'mongoose';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import youtubeDl from 'youtube-dl-exec'; // ── Native Audio Extractor Engine ──
-
-// ── 1. IMPORT YOUR ROUTE MODULES ─────────────────────────────────────
-import authRoutes from './routes/authRoutes.js';
-import searchRoutes from './routes/searchRoutes.js';
-import playlistRoutes from './routes/playlistRoutes.js';
-
+const dotenv = require('dotenv');
 dotenv.config();
-const app = express();
 
-// ── 2. GLOBAL MIDDLEWARE ──────────────────────────────────────────────
-app.use(cors());
+const express    = require('express');
+const cors       = require('cors');
+const connectDB  = require('./config/db');
+const { startKeepAlive } = require('./keepAlive');
+
+const authRoutes     = require('./routes/authRoutes');
+const searchRoutes   = require('./routes/searchRoutes');
+const playlistRoutes = require('./routes/playlistRoutes');
+const profileRoutes  = require('./routes/profileRoutes');
+const adminRoutes    = require('./routes/adminRoutes');
+
+connectDB();
+
+const app = express();
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ── 3. DATABASE CONFIGURATION ─────────────────────────────────────────
-mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/vstream')
-  .then(() => console.log('MongoDB cluster connected successfully'))
-  .catch((err) => console.error('Database connection critical failure:', err));
+app.get('/health', (req, res) => res.json({ status: 'ok', app: 'VStream' }));
 
-// ── 4. PRODUCTION API ROUTE MOUNTS ────────────────────────────────────
-app.use('/api/auth', authRoutes);
-app.use('/api/search', searchRoutes); // 👈 Fixed the 404 error by mounting this cleanly
-app.use('/api/playlists', playlistRoutes);
-
-// ── 5. NATIVE MOBILE AUDIO BACKGROUND STREAM BRIDGE ──────────────────────
-app.get('/api/songs/stream/:youtubeId', async (req, res) => {
-  const { youtubeId } = req.params;
-
-  if (!youtubeId) {
-    return res.status(400).json({ error: 'YouTube Video ID parameter is required' });
-  }
-
+app.get('/test-email', async (req, res) => {
   try {
-    // Queries yt-dlp to extract the raw, optimized background audio track stream URL from YouTube
-    const output = await youtubeDl(`https://www.youtube.com/watch?v=${youtubeId}`, {
-      getUrl: true,
-      format: 'bestaudio[ext=m4a]/bestaudio', // Targets high-efficiency, compressed mobile audio layers
+    const axios = require('axios');
+    await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender: { name: 'VStream', email: process.env.EMAIL_USER },
+      to: [{ email: process.env.EMAIL_USER }],
+      subject: 'VStream Email Test',
+      htmlContent: '<h1>Email working ✅</h1>'
+    }, {
+      headers: {
+        'api-key': process.env.BREVO_API_KEY,
+        'Content-Type': 'application/json'
+      }
     });
-
-    const directAudioStreamUrl = output.trim();
-
-    // 🚀 THE UX FIX: Perform an HTTP 302 redirect directly into the raw audio binary stream.
-    // This tricks mobile OS kernels (iOS & Android) into thinking it's a native audio player,
-    // keeping background progression awake on mobile browsers WITHOUT forcing "Request Desktop Site".
-    res.redirect(directAudioStreamUrl);
-  } catch (error) {
-    console.error('Mobile background audio stream bridge failure:', error);
-    res.status(500).json({ error: 'Could not resolve backend background streaming media channel' });
+    res.json({
+      status: 'Brevo HTTP API connected ✅',
+      user: process.env.EMAIL_USER,
+      apiKeyLength: process.env.BREVO_API_KEY?.length
+    });
+  } catch (err) {
+    res.json({
+      status: 'Brevo FAILED ❌',
+      error: err.response?.data?.message || err.message,
+      apiKeyLength: process.env.BREVO_API_KEY?.length
+    });
   }
 });
 
-// ── 6. APPLICATION SYSTEM HEALTH CHECK ────────────────────────────────
-app.get('/', (req, res) => {
-  res.status(200).json({ status: 'active', message: 'VSTREAM production API engine running' });
-});
+app.use('/api/auth',      authRoutes);
+app.use('/api/search',    searchRoutes);
+app.use('/api/playlists', playlistRoutes);
+app.use('/api/profile',   profileRoutes);
+app.use('/api/admin',     adminRoutes);   // ← NEW
 
-// ── 7. SERVER PORT BINDING AND INITIALIZATION ────────────────────────
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`VSTREAM Server cluster initializing securely on port ${PORT}`);
+  console.log(`VStream server running on port ${PORT}`);
+  startKeepAlive();
 });
-
-
-
-
-// const dotenv = require('dotenv');
-// dotenv.config();
-
-// const express    = require('express');
-// const cors       = require('cors');
-// const connectDB  = require('./config/db');
-// const { startKeepAlive } = require('./keepAlive');
-
-// const authRoutes     = require('./routes/authRoutes');
-// const searchRoutes   = require('./routes/searchRoutes');
-// const playlistRoutes = require('./routes/playlistRoutes');
-// const profileRoutes  = require('./routes/profileRoutes');
-// const adminRoutes    = require('./routes/adminRoutes');
-
-// connectDB();
-
-// const app = express();
-// app.use(cors({ origin: '*' }));
-// app.use(express.json());
-
-// app.get('/health', (req, res) => res.json({ status: 'ok', app: 'VStream' }));
-
-// app.get('/test-email', async (req, res) => {
-//   try {
-//     const axios = require('axios');
-//     await axios.post('https://api.brevo.com/v3/smtp/email', {
-//       sender: { name: 'VStream', email: process.env.EMAIL_USER },
-//       to: [{ email: process.env.EMAIL_USER }],
-//       subject: 'VStream Email Test',
-//       htmlContent: '<h1>Email working ✅</h1>'
-//     }, {
-//       headers: {
-//         'api-key': process.env.BREVO_API_KEY,
-//         'Content-Type': 'application/json'
-//       }
-//     });
-//     res.json({
-//       status: 'Brevo HTTP API connected ✅',
-//       user: process.env.EMAIL_USER,
-//       apiKeyLength: process.env.BREVO_API_KEY?.length
-//     });
-//   } catch (err) {
-//     res.json({
-//       status: 'Brevo FAILED ❌',
-//       error: err.response?.data?.message || err.message,
-//       apiKeyLength: process.env.BREVO_API_KEY?.length
-//     });
-//   }
-// });
-
-// app.use('/api/auth',      authRoutes);
-// app.use('/api/search',    searchRoutes);
-// app.use('/api/playlists', playlistRoutes);
-// app.use('/api/profile',   profileRoutes);
-// app.use('/api/admin',     adminRoutes);   // ← NEW
-
-// const PORT = process.env.PORT || 5000;
-// app.listen(PORT, () => {
-//   console.log(`VStream server running on port ${PORT}`);
-//   startKeepAlive();
-// });
 
 
 
