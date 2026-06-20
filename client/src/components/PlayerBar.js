@@ -100,7 +100,7 @@ ${text}`
     try {
       const cleanTitle = song.title
         .replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '')
-        .replace(/\|.*/g, '').replace(/ft\.?.*/ ,'')
+        .replace(/\|.*/g, '').replace(/ft\.?.*/gi, '')
         .replace(/feat\.?.*/gi, '').trim();
       const aggressiveTitle = cleanTitle
         .replace(/\s*-\s*.*/g, '').replace(/official.*/gi, '')
@@ -191,71 +191,36 @@ ${text}`
   useEffect(() => () => stopProgressTracking(), []);
 
   // ── Silent audio — keeps Media Session notification alive ─────────────
-  // Created fresh every time, with a self-healing pause listener and
-  // re-creation fallback in case the browser permanently suspends it.
-  const createSilentAudio = () => {
-    try {
-      const audio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
-      audio.loop = true;
-      audio.volume = 0.001;
-      audio.setAttribute('playsinline', 'true');
-      audio.addEventListener('pause', () => {
-        if (!audio.ended && silentAudioRef.current === audio) {
-          audio.play().catch(() => {});
-        }
-      });
-      audio.addEventListener('ended', () => {
-        if (silentAudioRef.current === audio) audio.play().catch(() => {});
-      });
-      silentAudioRef.current = audio;
-      return audio;
-    } catch {
-      return null;
-    }
-  };
-
-  // Safe wrapper — recreates the element if it got lost/suspended
-  const ensureSilentAudioPlaying = () => {
-    try {
-      let audio = silentAudioRef.current;
-      if (!audio) audio = createSilentAudio();
-      if (audio) {
-        const p = audio.play();
-        if (p && typeof p.catch === 'function') {
-          p.catch(() => {
-            // Browser blocked it (e.g. revisit without fresh gesture) — recreate and retry once
-            const fresh = createSilentAudio();
-            fresh?.play().catch(() => {});
-          });
-        }
-      }
-    } catch {}
+  // FIX 1: create on first user gesture too (handles revisits where
+  // autoplay-without-gesture is blocked), not just on mount.
+  const ensureSilentAudio = () => {
+    if (silentAudioRef.current) return silentAudioRef.current;
+    const audio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
+    audio.loop = true;
+    audio.volume = 0.001;
+    audio.addEventListener('pause', () => { if (!audio.ended) audio.play().catch(() => {}); });
+    silentAudioRef.current = audio;
+    return audio;
   };
 
   useEffect(() => {
-    createSilentAudio();
-    return () => {
-      try { silentAudioRef.current?.pause(); } catch {}
-      silentAudioRef.current = null;
-    };
+    ensureSilentAudio();
+    return () => { silentAudioRef.current?.pause(); silentAudioRef.current = null; };
   }, []);
 
-  // Unlock/start audio on the very first user interaction of this visit —
-  // required so revisits (where autoplay is blocked) still get a real gesture.
+  // FIX 1b: unlock audio on first tap/click of THIS visit — required
+  // for revisits where the browser blocks autoplay without a fresh gesture.
   useEffect(() => {
     const unlock = () => {
-      ensureSilentAudioPlaying();
+      ensureSilentAudio().play().catch(() => {});
       document.removeEventListener('click', unlock);
       document.removeEventListener('touchstart', unlock);
-      document.removeEventListener('keydown', unlock);
     };
     document.addEventListener('click', unlock);
     document.addEventListener('touchstart', unlock);
-    document.addEventListener('keydown', unlock);
     return () => {
       document.removeEventListener('click', unlock);
       document.removeEventListener('touchstart', unlock);
-      document.removeEventListener('keydown', unlock);
     };
   }, []);
 
@@ -263,7 +228,7 @@ ${text}`
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
-        ensureSilentAudioPlaying();
+        ensureSilentAudio().play().catch(() => {});
         setTimeout(() => {
           try {
             if (playerRef.current && isReady.current) {
@@ -272,10 +237,6 @@ ${text}`
             }
           } catch {}
         }, 300);
-      } else {
-        // Going to background — make sure silent audio is running NOW
-        // (must be triggered while still in foreground/visible context)
-        ensureSilentAudioPlaying();
       }
     };
     document.addEventListener('visibilitychange', onVisible);
@@ -287,33 +248,6 @@ ${text}`
       window.removeEventListener('pageshow', onVisible);
     };
   }, []);
-
-  // ── Watchdog: detect song end even if YouTube's ENDED event is throttled
-  // in background. Backup trigger using elapsed-time check via progress poll.
-  useEffect(() => {
-    const watchdog = setInterval(() => {
-      try {
-        if (!playerRef.current || !isReady.current) return;
-        const cur   = playerRef.current.getCurrentTime?.();
-        const total = playerRef.current.getDuration?.();
-        const state = playerRef.current.getPlayerState?.();
-        if (total > 0 && cur >= total - 0.5 && state !== 0) {
-          // Song has effectively ended but state never reached ENDED (0)
-          stopProgressTracking();
-          setProgress(0);
-          setIsPlaying(false);
-          if (repeatRef.current === 'one') {
-            playerRef.current.seekTo(0, true);
-            playerRef.current.playVideo();
-            setIsPlaying(true);
-          } else {
-            playNextRef.current?.();
-          }
-        }
-      } catch {}
-    }, 1000);
-    return () => clearInterval(watchdog);
-  }, []); // eslint-disable-line
 
   // ── Fullscreen tracking ────────────────────────────────────────────────
   useEffect(() => {
@@ -381,7 +315,7 @@ ${text}`
               startProgressTracking();
               try { e.target.setPlaybackQuality('hd720'); } catch {}
               // Start silent audio to keep Media Session alive
-              ensureSilentAudioPlaying();
+              ensureSilentAudio().play().catch(() => {});
               if ('mediaSession' in navigator) {
                 navigator.mediaSession.metadata = new window.MediaMetadata({
                   title:   currentSongRef.current?.title  || '',
@@ -389,10 +323,10 @@ ${text}`
                   artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
                 });
                 navigator.mediaSession.playbackState = 'playing';
-                navigator.mediaSession.setActionHandler('play',          () => { ensureSilentAudioPlaying(); playerRef.current?.playVideo();  setIsPlaying(true);  navigator.mediaSession.playbackState = 'playing'; });
+                navigator.mediaSession.setActionHandler('play',          () => { ensureSilentAudio().play().catch(()=>{}); playerRef.current?.playVideo();  setIsPlaying(true);  navigator.mediaSession.playbackState = 'playing'; });
                 navigator.mediaSession.setActionHandler('pause',         () => { playerRef.current?.pauseVideo(); setIsPlaying(false); navigator.mediaSession.playbackState = 'paused'; });
-                navigator.mediaSession.setActionHandler('nexttrack',     () => { ensureSilentAudioPlaying(); playNextRef.current?.(); });
-                navigator.mediaSession.setActionHandler('previoustrack', () => { ensureSilentAudioPlaying(); playPrev(); });
+                navigator.mediaSession.setActionHandler('nexttrack',     () => { ensureSilentAudio().play().catch(()=>{}); playNextRef.current?.(); });
+                navigator.mediaSession.setActionHandler('previoustrack', () => { ensureSilentAudio().play().catch(()=>{}); playPrev(); });
                 navigator.mediaSession.setActionHandler('stop',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); navigator.mediaSession.playbackState = 'paused'; });
               }
             } else if (e.data === window.YT.PlayerState.PAUSED) {
@@ -425,6 +359,35 @@ ${text}`
     if (window.YT?.Player) initPlayer();
     else window.onYouTubeIframeAPIReady = initPlayer;
   }, [songKey]); // eslint-disable-line
+
+  // FIX 2: watchdog backup — if YouTube's ENDED event gets throttled while
+  // app is backgrounded, this still detects "song reached its end" and
+  // triggers next/repeat exactly the same way the ENDED handler does.
+  useEffect(() => {
+    const watchdog = setInterval(() => {
+      try {
+        if (!playerRef.current || !isReady.current) return;
+        const cur   = playerRef.current.getCurrentTime?.();
+        const total = playerRef.current.getDuration?.();
+        const state = playerRef.current.getPlayerState?.();
+        // state 0 = ENDED already handled by onStateChange; this catches
+        // the case where YT never fires ENDED while backgrounded.
+        if (total > 0 && cur >= total - 0.5 && state !== 0 && state !== -1) {
+          stopProgressTracking();
+          setProgress(0);
+          setIsPlaying(false);
+          if (repeatRef.current === 'one') {
+            playerRef.current.seekTo(0, true);
+            playerRef.current.playVideo();
+            setIsPlaying(true);
+          } else {
+            playNextRef.current?.();
+          }
+        }
+      } catch {}
+    }, 1000);
+    return () => clearInterval(watchdog);
+  }, []); // eslint-disable-line
 
   // ── Play / pause ────────────────────────────────────────────────────────
   useEffect(() => {
