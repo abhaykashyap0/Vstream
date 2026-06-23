@@ -6,12 +6,16 @@ import axios from 'axios';
 const PlayerBar = () => {
   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
 
-  // ── Persistent References to Bypass Closures ───────────────────────────
-  const playNextRef    = useRef(null);
+  // ── Persistent References to Defeat Mobile State Throttling ──
+  const playNextRef = useRef(null);
+  const playPrevRef = useRef(null);
+  const togglePlayRef = useRef(null);
   const currentSongRef = useRef(null);
   const repeatRef      = useRef(repeat);
 
-  useEffect(() => { playNextRef.current    = playNext;    }, [playNext]);
+  useEffect(() => { playNextRef.current   = playNext;   }, [playNext]);
+  useEffect(() => { playPrevRef.current   = playPrev;   }, [playPrev]);
+  useEffect(() => { togglePlayRef.current = togglePlay; }, [togglePlay]);
   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
   useEffect(() => { repeatRef.current      = repeat;      }, [repeat]);
 
@@ -23,7 +27,7 @@ const PlayerBar = () => {
 
   const [progress, setProgress]                   = useState(0);
   const [volume, setVolume]                       = useState(100);
-  const [isMuted, setIsMuted]                     = useState(false);
+  const [isMuted, setIsMuted]                      = useState(false);
   const [showModal, setShowModal]                 = useState(false);
   const [isFullscreen, setIsFullscreen]           = useState(false);
   const [activeTab, setActiveTab]                 = useState('video');
@@ -55,16 +59,7 @@ const PlayerBar = () => {
           max_tokens: 1000,
           messages: [{
             role: 'user',
-            content: `Transliterate these Hindi/Devanagari song lyrics to Hinglish (Roman script). 
-Rules:
-- Keep English words/lines exactly as they are
-- Transliterate Hindi words to how they sound in Roman/English letters
-- Keep line breaks exactly the same
-- Do not translate — only transliterate the pronunciation
-- Return ONLY the transliterated lyrics, nothing else
-
-Lyrics:
-${text}`
+            content: `Transliterate these Hindi/Devanagari song lyrics to Hinglish (Roman script). \nRules:\n- Keep English words/lines exactly as they are\n- Transliterate Hindi words to how they sound in Roman/English letters\n- Keep line breaks exactly the same\n- Do not translate — only transliterate the pronunciation\n- Return ONLY the transliterated lyrics, nothing else\n\nLyrics:\n${text}`
           }]
         })
       });
@@ -190,15 +185,13 @@ ${text}`
   };
   useEffect(() => () => stopProgressTracking(), []);
 
-  // ── Silent audio — keeps Media Session notification alive ─────────────
-  // FIX 1: create on first user gesture too (handles revisits where
-  // autoplay-without-gesture is blocked), not just on mount.
+  // ── Native Mobile Background Audio Stream Pipeline Anchor ─────────────
   const ensureSilentAudio = () => {
     if (silentAudioRef.current) return silentAudioRef.current;
     const audio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
     audio.loop = true;
-    audio.volume = 0.001;
-    audio.addEventListener('pause', () => { if (!audio.ended) audio.play().catch(() => {}); });
+    audio.volume = 0.01; // Increase slightly so the mobile CPU treats it as a persistent stream
+    audio.addEventListener('pause', () => { if (!audio.ended && togglePlayRef.current) audio.play().catch(() => {}); });
     silentAudioRef.current = audio;
     return audio;
   };
@@ -208,8 +201,6 @@ ${text}`
     return () => { silentAudioRef.current?.pause(); silentAudioRef.current = null; };
   }, []);
 
-  // FIX 1b: unlock audio on first tap/click of THIS visit — required
-  // for revisits where the browser blocks autoplay without a fresh gesture.
   useEffect(() => {
     const unlock = () => {
       ensureSilentAudio().play().catch(() => {});
@@ -277,12 +268,9 @@ ${text}`
     if (!currentSong) return;
 
     const initPlayer = () => {
-      // If player exists and is ready — use loadVideoById (smoother, no flicker)
       if (playerRef.current && isReady.current && typeof playerRef.current.loadVideoById === 'function') {
         const activeVideoId = playerRef.current.getVideoData?.()?.video_id;
         if (activeVideoId !== currentSong.youtube_id) {
-          // Wake the silent audio/page context first — important when this
-          // fires from the background watchdog or notification next/prev.
           try { ensureSilentAudio().play().catch(() => {}); } catch {}
 
           const targetId = currentSong.youtube_id;
@@ -293,7 +281,6 @@ ${text}`
               playerRef.current.loadVideoById({ videoId: targetId, suggestedQuality: 'hd720' });
               setIsPlaying(true);
             } catch {}
-            // Verify it actually took — retry if the iframe context was suspended
             setTimeout(() => {
               try {
                 const loadedId = playerRef.current?.getVideoData?.()?.video_id;
@@ -311,7 +298,6 @@ ${text}`
         return;
       }
 
-      // First time — create player
       if (playerRef.current) {
         try { playerRef.current.destroy(); } catch {}
         playerRef.current = null;
@@ -338,17 +324,8 @@ ${text}`
               setIsPlaying(true);
               startProgressTracking();
               try { e.target.setPlaybackQuality('hd720'); } catch {}
-              // Start silent audio to keep Media Session alive.
-              // Retry a few times — first-ever play() in a session can be
-              // rejected even right after a real user gesture due to timing;
-              // this guarantees it's actually running before we rely on it.
-              const wakeSilentAudio = (n = 0) => {
-                const p = ensureSilentAudio().play();
-                if (p && typeof p.catch === 'function') {
-                  p.catch(() => { if (n < 5) setTimeout(() => wakeSilentAudio(n + 1), 200); });
-                }
-              };
-              wakeSilentAudio();
+              ensureSilentAudio().play().catch(() => {});
+              
               if ('mediaSession' in navigator) {
                 navigator.mediaSession.metadata = new window.MediaMetadata({
                   title:   currentSongRef.current?.title  || '',
@@ -356,94 +333,19 @@ ${text}`
                   artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
                 });
                 navigator.mediaSession.playbackState = 'playing';
-                navigator.mediaSession.setActionHandler('play', async () => {
-                  // Resume silent audio FIRST — this wakes the suspended page/JS context
-                  try { await ensureSilentAudio().play(); } catch {}
-                  navigator.mediaSession.playbackState = 'playing';
-                  setIsPlaying(true);
-
-                  const songToPlay = currentSongRef.current;
-
-                  // Retry playVideo a few times — iframe context may take a moment to wake up.
-                  // If the player object is dead (Android killed the iframe JS context while
-                  // backgrounded), recreate it entirely as a last resort.
-                  let attempts = 0;
-                  const tryPlay = () => {
-                    attempts++;
-                    try {
-                      playerRef.current?.playVideo();
-                    } catch {}
-                    setTimeout(() => {
-                      let state = -99;
-                      try { state = playerRef.current?.getPlayerState?.(); } catch {}
-                      if (state === 1) return; // success — actually playing
-                      if (attempts < 4) {
-                        tryPlay();
-                      } else {
-                        // Final fallback: force-recreate the player for the current song
-                        try {
-                          if (playerRef.current) { try { playerRef.current.destroy(); } catch {} }
-                          playerRef.current = null;
-                          isReady.current = false;
-                          if (songToPlay && window.YT?.Player) {
-                            playerRef.current = new window.YT.Player(playerContRef.current, {
-                              videoId: songToPlay.youtube_id,
-                              playerVars: {
-                                autoplay: 1, controls: 0, disablekb: 1, fs: 0,
-                                iv_load_policy: 3, modestbranding: 1, rel: 0,
-                                playsinline: 1, origin: window.location.origin, vq: 'hd720'
-                              },
-                              events: {
-                                onReady: (e) => {
-                                  isReady.current = true;
-                                  e.target.unMute();
-                                  e.target.setVolume(volume);
-                                  e.target.playVideo();
-                                  setIsPlaying(true);
-                                },
-                                onStateChange: (e) => {
-                                  if (e.data === window.YT.PlayerState.PLAYING) {
-                                    setIsPlaying(true);
-                                    startProgressTracking();
-                                  } else if (e.data === window.YT.PlayerState.PAUSED) {
-                                    setIsPlaying(false);
-                                    stopProgressTracking();
-                                  } else if (e.data === window.YT.PlayerState.ENDED) {
-                                    if (repeatRef.current === 'one') {
-                                      e.target.seekTo(0, true);
-                                      e.target.playVideo();
-                                    } else {
-                                      playNextRef.current?.();
-                                    }
-                                  }
-                                },
-                                onError: () => { playNextRef.current?.(); }
-                              }
-                            });
-                          }
-                        } catch {}
-                      }
-                    }, 250);
-                  };
-                  tryPlay();
+                
+                // ✅ UX FIX: Action handlers execute context triggers via tracking pointers directly
+                navigator.mediaSession.setActionHandler('play', () => {
+                  togglePlayRef.current?.();
                 });
                 navigator.mediaSession.setActionHandler('pause', () => {
-                  playerRef.current?.pauseVideo();
-                  setIsPlaying(false);
-                  navigator.mediaSession.playbackState = 'paused';
+                  togglePlayRef.current?.();
                 });
-                navigator.mediaSession.setActionHandler('nexttrack', async () => {
-                  try { await ensureSilentAudio().play(); } catch {}
+                navigator.mediaSession.setActionHandler('nexttrack', () => {
                   playNextRef.current?.();
                 });
-                navigator.mediaSession.setActionHandler('previoustrack', async () => {
-                  try { await ensureSilentAudio().play(); } catch {}
-                  playPrev();
-                });
-                navigator.mediaSession.setActionHandler('stop', () => {
-                  playerRef.current?.pauseVideo();
-                  setIsPlaying(false);
-                  navigator.mediaSession.playbackState = 'paused';
+                navigator.mediaSession.setActionHandler('previoustrack', () => {
+                  playPrevRef.current?.();
                 });
               }
             } else if (e.data === window.YT.PlayerState.PAUSED) {
@@ -455,7 +357,7 @@ ${text}`
               setProgress(0);
               setIsPlaying(false);
               if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-              // ✅ repeatRef avoids stale closure — always has current repeat value
+              
               if (repeatRef.current === 'one') {
                 e.target.seekTo(0, true);
                 e.target.playVideo();
@@ -477,9 +379,7 @@ ${text}`
     else window.onYouTubeIframeAPIReady = initPlayer;
   }, [songKey]); // eslint-disable-line
 
-  // FIX 2: watchdog backup — if YouTube's ENDED event gets throttled while
-  // app is backgrounded, this still detects "song reached its end" and
-  // triggers next/repeat exactly the same way the ENDED handler does.
+  // ── Watchdog Backup Background Monitor ──────────────────────────────────
   useEffect(() => {
     const watchdog = setInterval(() => {
       try {
@@ -487,13 +387,10 @@ ${text}`
         const cur   = playerRef.current.getCurrentTime?.();
         const total = playerRef.current.getDuration?.();
         const state = playerRef.current.getPlayerState?.();
-        // state 0 = ENDED already handled by onStateChange; this catches
-        // the case where YT never fires ENDED while backgrounded.
         if (total > 0 && cur >= total - 0.5 && state !== 0 && state !== -1) {
           stopProgressTracking();
           setProgress(0);
           setIsPlaying(false);
-          // Wake the page/audio context first — same trick used by notification buttons
           try { ensureSilentAudio().play().catch(() => {}); } catch {}
           if (repeatRef.current === 'one') {
             playerRef.current.seekTo(0, true);
@@ -508,16 +405,27 @@ ${text}`
     return () => clearInterval(watchdog);
   }, []); // eslint-disable-line
 
-  // ── Play / pause ────────────────────────────────────────────────────────
+  // ── Play / Pause State Synchronizer ──────────────────────────────────────
   useEffect(() => {
     if (!playerRef.current || !isReady.current) return;
-    if (isPlaying) {
-      playerRef.current.unMute();
-      playerRef.current.setVolume(volume);
+    try {
       const state = playerRef.current.getPlayerState?.();
-      if (state !== 1) playerRef.current.playVideo(); // avoid redundant call if already playing
-    } else {
-      playerRef.current.pauseVideo();
+      if (isPlaying) {
+        playerRef.current.unMute();
+        playerRef.current.setVolume(volume);
+        // Direct pointer injection handles frozen background mobile window frames
+        if (state !== 1 && state !== 3) {
+          playerRef.current.playVideo();
+        }
+        ensureSilentAudio().play().catch(() => {});
+      } else {
+        if (state === 1 || state === 3) {
+          playerRef.current.pauseVideo();
+        }
+        silentAudioRef.current?.pause();
+      }
+    } catch (e) {
+      console.error("Context synchronization lock error:", e);
     }
   }, [isPlaying]); // eslint-disable-line
 
