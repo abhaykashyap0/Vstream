@@ -6,7 +6,7 @@ import axios from 'axios';
 const PlayerBar = () => {
   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
 
-  // ── Persistent References to Bypass Asynchronous OS Thread Locks ──
+  // ── Persistent References to Defeat Mobile App Sleep Sleep Modes ──
   const playNextRef = useRef(null);
   const playPrevRef = useRef(null);
   const setIsPlayingRef = useRef(null);
@@ -19,7 +19,7 @@ const PlayerBar = () => {
   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
   useEffect(() => { repeatRef.current      = repeat;      }, [repeat]);
 
-  // ── NATIVE HTML5 AUDIO ENGINE INSTANCE ───────────────────────────────────
+  // ── Native HTML5 Audio Element Engine ───────────────────────────────────
   const audioInstanceRef = useRef(new Audio());
 
   const [progress, setProgress]                   = useState(0);
@@ -150,25 +150,30 @@ const PlayerBar = () => {
 
   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
 
-  // ── Native Core Audio Media Asset Lifecycles ───────────────────────────
+  // ── Native Core Audio Asset Lifecycle Tracker ──────────────────────────
   useEffect(() => {
     if (!currentSong) return;
 
     const audio = audioInstanceRef.current;
 
-    // ✅ SAAVN STREAM INTERCEPT: Connects directly to the native audio link from the API object schema
-    // (Ensure your song objects pass down the direct stream url from Saavn into song.audio_url)
+    // ✅ FIXED STREAM INJECTION POINT:
+    // Pulls direct high-quality streaming binaries from the public Saavn endpoint payload.
+    // This supports background play on locked phones without using YouTube data extraction paths.
     if (currentSong.audio_url) {
       audio.src = currentSong.audio_url;
+    } else if (currentSong.downloadUrl && currentSong.downloadUrl.length > 0) {
+      // Automatic mapping fallback rule if raw payload array is passed down directly
+      const highQualityTrack = currentSong.downloadUrl[currentSong.downloadUrl.length - 1].link;
+      audio.src = highQualityTrack;
     } else {
-      // Fallback proxy layout if using backend mapping
-      audio.src = `/api/songs/stream/${currentSong.youtube_id}`;
+      console.warn("No clear audio stream source defined inside selected track data schema.");
+      return;
     }
     
     audio.load();
 
     if (isPlaying) {
-      audio.play().catch(err => console.log("Background native media anchor wake:", err));
+      audio.play().catch(err => console.log("Native background streaming thread active:", err));
     }
 
     const handleTimeUpdate = () => {
@@ -188,7 +193,7 @@ const PlayerBar = () => {
       });
     };
 
-    // System Tray notification hardware connection pipelines linked straight to the active binary audio element context
+    // System tray notification tray handlers linked cleanly to the browser instance execution state
     const registerMediaSession = () => {
       if ('mediaSession' in navigator) {
         navigator.mediaSession.metadata = new window.MediaMetadata({
@@ -242,7 +247,7 @@ const PlayerBar = () => {
     };
   }, [songKey]); // eslint-disable-line
 
-  // UI button synchronization controls layer
+  // UI interface synchronizer layer
   useEffect(() => {
     const audio = audioInstanceRef.current;
     if (isPlaying) {
@@ -259,7 +264,7 @@ const PlayerBar = () => {
     audioInstanceRef.current.volume = isMuted ? 0 : volume / 100;
   }, [volume, isMuted]);
 
-  // ── Controls Interface Handlers ─────────────────────────────────────────
+  // ── Custom Event Utilities ─────────────────────────────────────────────
   const handleSeek = (e) => {
     const audio = audioInstanceRef.current;
     const clickX = e.nativeEvent.offsetX;
@@ -274,9 +279,7 @@ const PlayerBar = () => {
     setIsMuted(val === 0);
   };
 
-  const toggleMute = () => {
-    setIsMuted(!isMuted);
-  };
+  const toggleMute = () => { setIsMuted(!isMuted); };
 
   const renderLyrics = () => {
     if (lyricsLoading) return (
@@ -297,13 +300,9 @@ const PlayerBar = () => {
             const isPast    = globalIndex < currentLineIndex;
             return (
               <div key={globalIndex} style={{
-                textAlign: 'center',
-                fontSize: isCurrent ? '1.5rem' : '1.1rem',
-                fontWeight: isCurrent ? 'bold' : 'normal',
+                textAlign: 'center', fontSize: isCurrent ? '1.5rem' : '1.1rem', fontWeight: isCurrent ? 'bold' : 'normal',
                 color: isCurrent ? '#1db954' : isNext ? '#ffffff' : isPast ? '#555' : '#888',
-                transition: 'all 0.3s ease', lineHeight: '1.5',
-                opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
-                transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+                transition: 'all 0.3s ease', lineHeight: '1.5', opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4, transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
               }}>
                 {line.text || ' '}
               </div>
@@ -330,11 +329,10 @@ const PlayerBar = () => {
 
   return (
     <>
-      {/* ── EXPANDED MODAL OVERLAY VIEW PANEL ── */}
+      {/* ── EXPANDED FULLSCREEN MODAL PANEL OVERLAY ── */}
       <div style={{
-        position: 'fixed', inset: 0, zIndex: 2000,
-        background: 'rgba(0,0,0,0.96)', display: 'flex', flexDirection: 'column',
-        visibility: showModal ? 'visible' : 'hidden', pointerEvents: showModal ? 'all' : 'none'
+        position: 'fixed', inset: 0, zIndex: 2000, background: 'rgba(0,0,0,0.96)',
+        display: 'flex', flexDirection: 'column', visibility: showModal ? 'visible' : 'hidden', pointerEvents: showModal ? 'all' : 'none'
       }}>
         <div style={{ display: 'flex', alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid #333', gap: '10px', flexWrap: 'nowrap', minWidth: 0 }}>
           <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
@@ -344,18 +342,17 @@ const PlayerBar = () => {
           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
             <button style={{ padding: '7px 12px', borderRadius: '20px', border: 'none', background: '#1db954', color: 'white', display: 'flex', alignItems: 'center', gap: '5px', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)' }}>
               <Music size={13} />
-              <span>Lyrics Context</span>
+              <span>Lyrics player</span>
             </button>
           </div>
-          <button onClick={() => setShowModal(false)} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '32px', height: '32px', flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white' }}>
+          <button onClick={() => setShowModal(false)} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '32px', height: '32px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white' }}>
             <X size={16} />
           </button>
         </div>
 
-        {/* Presentation Hub Layer (Completely layout-friendly, removes hidden video targets) */}
         <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px', width: '100%', maxWidth: '600px', padding: '20px' }}>
-            <img src={currentSong.image_url} alt={currentSong.title} style={{ width: 'clamp(180px, 42vw, 250px)', aspectRatio: '1/1', borderRadius: '12px', objectFit: 'cover', boxShadow: '0 8px 24px rgba(0,0,0,0.5)' }} />
+            <img src={currentSong.image_url} alt={currentSong.title} style={{ width: 'clamp(180px, 42vw, 240px)', aspectRatio: '1/1', borderRadius: '12px', objectFit: 'cover', boxShadow: '0 8px 24px rgba(0,0,0,0.5)' }} />
             <div style={{ textAlign: 'center', width: '100%', marginTop: '5px' }}>
               <div style={{ fontWeight: 'bold', fontSize: '1.15rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
               <div style={{ color: '#b3b3b3', fontSize: '0.9rem', marginTop: '2px' }}>{currentSong.artist}</div>
@@ -387,7 +384,6 @@ const PlayerBar = () => {
           </div>
         </div>
 
-        {/* Modal Bottom Controls Deck Container Layout */}
         <div style={{ padding: '12px 24px 24px', borderTop: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '12px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '28px' }}>
             <Shuffle size={19} onClick={toggleShuffle} style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
@@ -407,7 +403,7 @@ const PlayerBar = () => {
         </div>
       </div>
 
-      {/* ── STANDARD COLLAPSED APPLICATION FOOTER BAR ── */}
+      {/* ── STANDARD COLLAPSED APPLICATION FOOTER CONTAINER PANEL ── */}
       <div className="player-bar">
         <div className="player-info" style={{ cursor: 'pointer' }} onClick={() => setShowModal(true)}>
           <img src={currentSong.image_url} alt={currentSong.title} />
