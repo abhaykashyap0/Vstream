@@ -6,7 +6,7 @@ import axios from 'axios';
 const PlayerBar = () => {
   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
 
-  // ── Persistent References to Defeat Mobile App Sleep Sleep Modes ──
+  // ── Persistent References to Bypass Asynchronous OS Thread Locks ──
   const playNextRef = useRef(null);
   const playPrevRef = useRef(null);
   const setIsPlayingRef = useRef(null);
@@ -19,7 +19,7 @@ const PlayerBar = () => {
   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
   useEffect(() => { repeatRef.current      = repeat;      }, [repeat]);
 
-  // ── Native HTML5 Audio Element Engine ───────────────────────────────────
+  // ── Native HTML5 Audio Engine Instance ──
   const audioInstanceRef = useRef(new Audio());
 
   const [progress, setProgress]                   = useState(0);
@@ -156,13 +156,11 @@ const PlayerBar = () => {
 
     const audio = audioInstanceRef.current;
 
-    // ✅ FIXED STREAM INJECTION POINT:
-    // Pulls direct high-quality streaming binaries from the public Saavn endpoint payload.
-    // This supports background play on locked phones without using YouTube data extraction paths.
+    // Pulls direct high-quality streaming URL from your mapped state
     if (currentSong.audio_url) {
       audio.src = currentSong.audio_url;
     } else if (currentSong.downloadUrl && currentSong.downloadUrl.length > 0) {
-      // Automatic mapping fallback rule if raw payload array is passed down directly
+      // Direct raw Saavn downloadUrl fallback logic
       const highQualityTrack = currentSong.downloadUrl[currentSong.downloadUrl.length - 1].link;
       audio.src = highQualityTrack;
     } else {
