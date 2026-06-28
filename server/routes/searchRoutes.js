@@ -52,6 +52,16 @@ const getApiKey = () => {
 // Set JIOSAAVN_API_BASE in .env if you deploy your own instance later
 const JIOSAAVN_API_BASE = process.env.JIOSAAVN_API_BASE || 'https://saavn.dev/api';
 
+// ── DNS fix for some hosting providers (e.g. Render) that fail to
+// resolve certain TLDs like .dev through their default resolver ────────
+const dns = require('dns');
+try {
+  dns.setDefaultResultOrder('ipv4first');
+  dns.setServers(['8.8.8.8', '1.1.1.1']); // Google + Cloudflare public DNS
+} catch (e) {
+  console.warn('Could not set custom DNS servers:', e.message);
+}
+
 // ── Search JioSaavn — returns normalized song objects or [] on failure ──
 const searchJioSaavn = async (query) => {
   try {
@@ -434,7 +444,6 @@ router.get('/smart-playlist', optionalAuth, async (req, res) => {
 });
 
 module.exports = router;
-
 
 
 //ok but logs
