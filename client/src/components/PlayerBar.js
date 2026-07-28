@@ -226,9 +226,7 @@ ${text}`
     if (!currentSong) return;
 
     // Determine stream URL: JioSaavn = direct CDN, YouTube = resolved via server
-    const streamUrl = isJioSaavn
-      ? currentSong.stream_url
-      : (ytAudioMode ? ytAudioUrl : null);
+    const streamUrl = ytAudioMode ? ytAudioUrl : null;
 
     if (!streamUrl) return; // YouTube song not yet resolved (or IFrame mode)
 
