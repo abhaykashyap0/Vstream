@@ -3,19 +3,16 @@ import { MusicContext } from '../context/MusicContext';
 import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
 import axios from 'axios';
 
-const API = process.env.REACT_APP_API_URL || '';
-// ── Stream server for YouTube audio resolution ─────────────────────
-const STREAM_SERVER = 'https://rancidity-retrain-glacier.ngrok-free.dev';
-const [resolvedYoutubeAudioUrl, setResolvedYoutubeAudioUrl] = useState(null);
-const [isResolvingAudio, setIsResolvingAudio]               = useState(false);
-// True when YouTube song has been resolved to native audio URL
-// In this case we use the same HTML5 <audio> engine as JioSaavn
-const useNativeAudio = isJioSaavn || !!resolvedYoutubeAudioUrl;
+const API           = process.env.REACT_APP_API_URL || '';
+const STREAM_SERVER = 'https://rancidity-retrain-glacier.ngrok-free.dev'; // your permanent ngrok URL
 
 const PlayerBar = () => {
-  const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+  const {
+    currentSong, songKey, isPlaying, togglePlay, setIsPlaying,
+    playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat
+  } = useContext(MusicContext);
 
-  // ── Persistent References to Bypass Closures ───────────────────────────
+  // ── Persistent refs to avoid stale closures ──────────────────────────
   const playNextRef    = useRef(null);
   const playPrevRef    = useRef(null);
   const currentSongRef = useRef(null);
@@ -26,31 +23,37 @@ const PlayerBar = () => {
   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
   useEffect(() => { repeatRef.current      = repeat;      }, [repeat]);
 
-  // ── Native HTML5 audio — PRIMARY engine for JioSaavn songs ──────────────
-  const audioRef = useRef(new Audio());
-
-  // ── YouTube IFrame — used for YouTube-sourced songs + video modal ───────
-  const playerRef       = useRef(null);
-  const playerContRef   = useRef(null);
+  // ── Audio engines ─────────────────────────────────────────────────────
+  // PRIMARY:  HTML5 <audio> — JioSaavn songs + YouTube songs via stream server
+  // FALLBACK: YouTube IFrame — when stream server unavailable OR for Video tab
+  const audioRef      = useRef(new Audio());
+  const playerRef     = useRef(null);
+  const playerContRef = useRef(null);
   const videoWrapperRef = useRef(null);
-  const isReady         = useRef(false);
+  const isReady       = useRef(false);
 
+  // ── State ─────────────────────────────────────────────────────────────
   const [progress, setProgress]                   = useState(0);
   const [volume, setVolume]                       = useState(100);
   const [isMuted, setIsMuted]                     = useState(false);
   const [showModal, setShowModal]                 = useState(false);
   const [isFullscreen, setIsFullscreen]           = useState(false);
-  const [activeTab, setActiveTab]                 = useState('lyrics'); // default to lyrics, video is on-demand
+  const [activeTab, setActiveTab]                 = useState('lyrics');
   const [syncedLines, setSyncedLines]             = useState([]);
   const [plainLyrics, setPlainLyrics]             = useState('');
   const [lyricsLoading, setLyricsLoading]         = useState(false);
   const [currentLineIndex, setCurrentLineIndex]   = useState(0);
   const [lyricsOffset, setLyricsOffset]           = useState(1.5);
-  const [isTransliterating, setIsTransliterating] = useState(false);
   const [translitMode, setTranslitMode]           = useState('original');
   const [videoLoading, setVideoLoading]           = useState(false);
   const [videoError, setVideoError]               = useState('');
   const [resolvedYoutubeId, setResolvedYoutubeId] = useState(null);
+
+  // ── Stream server state (YouTube songs → native audio) ────────────────
+  const [resolvedAudioUrl, setResolvedAudioUrl]   = useState(null); // direct audio URL from stream server
+  const [isResolvingAudio, setIsResolvingAudio]   = useState(false);
+  const [streamServerOnline, setStreamServerOnline] = useState(true); // optimistic
+
   const progressInterval = useRef(null);
   const lyricsOffsetRef  = useRef(1.5);
 
@@ -58,156 +61,90 @@ const PlayerBar = () => {
   const hasPrev = currentIndex > 0;
   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
 
+  // ── Source detection ──────────────────────────────────────────────────
   const isJioSaavn = currentSong?.source === 'jiosaavn';
 
-  // ── Lyrics ─────────────────────────────────────────────────────────────
-  const hasDevanagari = (text) => /[\u0900-\u097F]/.test(text);
+  // Use native <audio> when:
+  // 1. Song is from JioSaavn (always), OR
+  // 2. Song is from YouTube AND stream server resolved a direct audio URL
+  const useNativeAudio = isJioSaavn || !!resolvedAudioUrl;
 
-  const transliterateToHinglish = async (text) => {
-    setIsTransliterating(true);
-    try {
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          messages: [{
-            role: 'user',
-            content: `Transliterate these Hindi/Devanagari song lyrics to Hinglish (Roman script). 
-Rules:
-- Keep English words/lines exactly as they are
-- Transliterate Hindi words to how they sound in Roman/English letters
-- Keep line breaks exactly the same
-- Do not translate — only transliterate the pronunciation
-- Return ONLY the transliterated lyrics, nothing else
+  // ── Resolve YouTube audio URL via stream server ───────────────────────
+  // Runs when a YouTube song is selected
+  // Caches result in MongoDB via streamRoutes so same song never hits yt-dlp twice
+  useEffect(() => {
+    setResolvedAudioUrl(null);
+    if (isJioSaavn || !currentSong?.youtube_id) return;
 
-Lyrics:
-${text}`
-          }]
-        })
-      });
-      const data = await response.json();
-      return data.content?.[0]?.text || text;
-    } catch (err) {
-      console.error('Transliteration error:', err);
-      return text;
-    } finally {
-      setIsTransliterating(false);
+    // First check if we have a cached audio URL in the song object
+    if (currentSong.resolved_audio_url) {
+      const now = Date.now();
+      if (!currentSong.audio_url_expires_at || currentSong.audio_url_expires_at > now) {
+        console.log('[Stream] Using cached audio URL for:', currentSong.title);
+        setResolvedAudioUrl(currentSong.resolved_audio_url);
+        return;
+      }
     }
-  };
 
-  const parseSyncedLyrics = (lrc) => {
-    if (!lrc) return [];
-    return lrc.split('\n')
-      .map(line => {
-        const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
-        if (!match) return null;
-        const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
-        return { time, text: match[3].trim() };
-      })
-      .filter(Boolean);
-  };
+    setIsResolvingAudio(true);
+    console.log('[Stream] Resolving audio URL for:', currentSong.title, currentSong.youtube_id);
 
-  const fetchLyrics = useCallback(async (song) => {
-    if (!song) return;
-    setLyricsLoading(true);
-    setSyncedLines([]);
-    setPlainLyrics('');
-    setCurrentLineIndex(0);
-    setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5;
-    try {
-      const cleanTitle = song.title
-        .replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '')
-        .replace(/\|.*/g, '').replace(/ft\.?.*/gi, '')
-        .replace(/feat\.?.*/gi, '').trim();
+    axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`, { timeout: 30000 })
+      .then(({ data }) => {
+        if (data.ok && data.url) {
+          console.log('[Stream] ✅ Got audio URL for:', currentSong.title);
+          setResolvedAudioUrl(data.url);
+          setStreamServerOnline(true);
 
-      const aggressiveTitle = cleanTitle
-        .replace(/\s*-\s*.*/g, '').replace(/official.*/gi, '')
-        .replace(/lyrics.*/gi, '').replace(/video.*/gi, '')
-        .replace(/hd.*/gi, '').replace(/full\s+song.*/gi, '').trim();
-
-      const cleanArtist = song.artist
-        .replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '')
-        .replace(/official$/i, '').replace(/music$/i, '').trim();
-
-      const scoredMatch = (results, targetTitle, targetArtist) => {
-        if (!results?.length) return null;
-        const t = targetTitle.toLowerCase();
-        const a = targetArtist.toLowerCase();
-        const scored = results.map(r => {
-          let score = 0;
-          const rt = (r.trackName || '').toLowerCase();
-          const ra = (r.artistName || '').toLowerCase();
-          if (rt === t) score += 100;
-          else if (rt.includes(t) || t.includes(rt)) score += 50;
-          if (ra === a) score += 40;
-          else if (ra.includes(a) || a.includes(ra)) score += 20;
-          if (r.syncedLyrics) score += 10;
-          return { result: r, score };
-        });
-        scored.sort((a, b) => b.score - a.score);
-        return scored[0].score > 0 ? scored[0].result : results[0];
-      };
-
-      const processResult = (match) => {
-        if (!match) return false;
-        if (match.syncedLyrics) {
-          const lines = parseSyncedLyrics(match.syncedLyrics);
-          if (lines.length > 0) { setSyncedLines(lines); return true; }
+          // Also cache it in our backend MongoDB so future plays don't need yt-dlp
+          axios.post(`${API}/api/stream/cache`, {
+            youtube_id:           currentSong.youtube_id,
+            resolved_audio_url:   data.url,
+            audio_url_expires_at: data.expires
+          }).catch(() => {}); // fire and forget
         }
-        if (match.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
-        return false;
-      };
+      })
+      .catch((err) => {
+        console.warn('[Stream] Server unavailable, falling back to IFrame:', err.message);
+        setStreamServerOnline(false);
+        // resolvedAudioUrl stays null → YouTube IFrame fallback activates automatically
+      })
+      .finally(() => setIsResolvingAudio(false));
 
-      let res = await axios.get('https://lrclib.net/api/search', { params: { q: `${aggressiveTitle} ${cleanArtist}` } });
-      if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
-      res = await axios.get('https://lrclib.net/api/search', { params: { q: aggressiveTitle } });
-      if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
-      res = await axios.get('https://lrclib.net/api/search', { params: { q: `${cleanTitle} ${cleanArtist}` } });
-      if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
-      res = await axios.get('https://lrclib.net/api/search', { params: { q: cleanTitle } });
-      if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
-      res = await axios.get('https://lrclib.net/api/get', { params: { track_name: aggressiveTitle, artist_name: cleanArtist } });
-      if (res.data && processResult(res.data)) return;
-      res = await axios.get('https://lrclib.net/api/search', { params: { q: song.title } });
-      if (res.data?.length > 0 && processResult(scoredMatch(res.data, song.title, cleanArtist))) return;
-      setPlainLyrics('Lyrics not found for this song.');
-    } catch {
-      setPlainLyrics('Could not load lyrics. Please try again.');
-    } finally {
-      setLyricsLoading(false);
-    }
-  }, []);
+  }, [songKey, isJioSaavn, currentSong?.youtube_id]); // eslint-disable-line
 
-  useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
-
-  // ── Reset video state whenever song changes ─────────────────────────────
+  // ── Reset state on song change ────────────────────────────────────────
   useEffect(() => {
     setResolvedYoutubeId(null);
     setVideoError('');
-    setActiveTab('lyrics'); // always start on lyrics — video is opt-in
+    setActiveTab('lyrics');
   }, [currentSong?._id]);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // ── PRIMARY AUDIO ENGINE — HTML5 <audio> for JioSaavn songs ─────────────
-  // This is what survives backgrounding — real native audio, no YouTube
-  // player restrictions apply here at all.
-  // ═══════════════════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════════════════
+  // PRIMARY AUDIO ENGINE — HTML5 <audio>
+  // Used for: JioSaavn songs (always) + YouTube songs (when stream server works)
+  // Survives backgrounding, works with Media Session API, lock screen controls
+  // ══════════════════════════════════════════════════════════════════════
   useEffect(() => {
-  if (!currentSong || !useNativeAudio) return;
+    if (!currentSong || !useNativeAudio) return;
 
     const audio = audioRef.current;
-   // JioSaavn uses direct CDN URL; YouTube uses stream-server resolved URL
-    audio.src = isJioSaavn ? currentSong.stream_url : resolvedYoutubeAudioUrl;
+
+    // Set the correct source
+    const src = isJioSaavn
+      ? currentSong.stream_url      // JioSaavn: direct 320kbps CDN URL
+      : resolvedAudioUrl;           // YouTube: stream server resolved URL
+
+    if (!src) return;
+
+    audio.src = src;
     audio.volume = isMuted ? 0 : volume / 100;
     audio.load();
 
-    const tryPlay = () => { audio.play().catch(() => {}); };
-    if (isPlaying) tryPlay();
+    if (isPlaying) audio.play().catch(() => {});
 
     const handleTimeUpdate = () => {
-      const cur = audio.currentTime;
+      const cur   = audio.currentTime;
       const total = audio.duration;
       if (total > 0) setProgress((cur / total) * 100);
       setSyncedLines(prev => {
@@ -225,8 +162,8 @@ ${text}`
     const registerMediaSession = () => {
       if (!('mediaSession' in navigator)) return;
       navigator.mediaSession.metadata = new window.MediaMetadata({
-        title:   currentSongRef.current?.title  || '',
-        artist:  currentSongRef.current?.artist || '',
+        title:   currentSongRef.current?.title   || '',
+        artist:  currentSongRef.current?.artist  || '',
         artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
       });
       navigator.mediaSession.setActionHandler('play',          () => { audio.play().catch(() => {}); setIsPlaying(true); });
@@ -236,8 +173,15 @@ ${text}`
       navigator.mediaSession.setActionHandler('stop',          () => { audio.pause(); setIsPlaying(false); });
     };
 
-    const handlePlay  = () => { setIsPlaying(true);  registerMediaSession(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing'; };
-    const handlePause = () => { setIsPlaying(false); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused'; };
+    const handlePlay  = () => {
+      setIsPlaying(true);
+      registerMediaSession();
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+    };
+    const handlePause = () => {
+      setIsPlaying(false);
+      if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+    };
     const handleEnded = () => {
       setProgress(0);
       if (repeatRef.current === 'one') {
@@ -248,54 +192,54 @@ ${text}`
         playNextRef.current?.();
       }
     };
-    const handleError = () => {
-      console.warn('JioSaavn audio failed to load, skipping to next');
+    const handleError = (e) => {
+      console.warn('[Audio] Playback error, skipping:', e);
       playNextRef.current?.();
     };
 
     audio.addEventListener('timeupdate', handleTimeUpdate);
-    audio.addEventListener('play', handlePlay);
-    audio.addEventListener('pause', handlePause);
-    audio.addEventListener('ended', handleEnded);
-    audio.addEventListener('error', handleError);
-
+    audio.addEventListener('play',       handlePlay);
+    audio.addEventListener('pause',      handlePause);
+    audio.addEventListener('ended',      handleEnded);
+    audio.addEventListener('error',      handleError);
     registerMediaSession();
 
     return () => {
       audio.removeEventListener('timeupdate', handleTimeUpdate);
-      audio.removeEventListener('play', handlePlay);
-      audio.removeEventListener('pause', handlePause);
-      audio.removeEventListener('ended', handleEnded);
-      audio.removeEventListener('error', handleError);
+      audio.removeEventListener('play',       handlePlay);
+      audio.removeEventListener('pause',      handlePause);
+      audio.removeEventListener('ended',      handleEnded);
+      audio.removeEventListener('error',      handleError);
     };
-  }, [songKey, isJioSaavn]); // eslint-disable-line
+  }, [songKey, useNativeAudio, resolvedAudioUrl]); // eslint-disable-line
 
-  // Sync play/pause + volume for the native audio engine
+  // Sync play/pause for native audio
   useEffect(() => {
     if (!useNativeAudio) return;
     const audio = audioRef.current;
     if (isPlaying) audio.play().catch(() => {});
     else audio.pause();
-  }, [isPlaying, isJioSaavn]);
+  }, [isPlaying, useNativeAudio]);
 
+  // Sync volume for native audio
   useEffect(() => {
     if (!useNativeAudio) return;
     audioRef.current.volume = isMuted ? 0 : volume / 100;
-  }, [volume, isMuted, isJioSaavn]);
+  }, [volume, isMuted, useNativeAudio]);
 
-  // ── Fully stop native audio whenever a YouTube song takes over ──────────
+  // Stop native audio when IFrame takes over
   useEffect(() => {
     if (!useNativeAudio) {
       try {
         const audio = audioRef.current;
         audio.pause();
         audio.currentTime = 0;
-        audio.src = ''; // fully release — prevents any lingering buffered audio
+        audio.src = '';
       } catch {}
     }
-  }, [isJioSaavn, songKey]);
+  }, [useNativeAudio, songKey]);
 
-  // ── Progress tracking (YouTube engine only) ──────────────────────────────
+  // ── Progress tracking for IFrame engine ──────────────────────────────
   const startProgressTracking = () => {
     stopProgressTracking();
     progressInterval.current = setInterval(() => {
@@ -331,15 +275,15 @@ ${text}`
         || document.mozFullScreenElement || document.msFullscreenElement);
       setIsFullscreen(full);
     };
-    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('fullscreenchange',       onChange);
     document.addEventListener('webkitfullscreenchange', onChange);
     return () => {
-      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('fullscreenchange',       onChange);
       document.removeEventListener('webkitfullscreenchange', onChange);
     };
   }, []);
 
-  // ── Load YouTube IFrame API once ────────────────────────────────────────
+  // ── Load YouTube IFrame API ───────────────────────────────────────────
   useEffect(() => {
     if (window.YT) return;
     const tag = document.createElement('script');
@@ -347,13 +291,17 @@ ${text}`
     document.body.appendChild(tag);
   }, []);
 
-  // ── YOUTUBE ENGINE — used when song.source === 'youtube' ────────────────
-  // (also reused for on-demand video playback of JioSaavn songs, see below)
+  // ══════════════════════════════════════════════════════════════════════
+  // FALLBACK / VIDEO ENGINE — YouTube IFrame
+  // Used for:
+  // 1. YouTube songs when stream server is offline (audio fallback)
+  // 2. Video tab — on-demand video view for any song
+  // ══════════════════════════════════════════════════════════════════════
   const initYouTubePlayer = useCallback((videoId, onReadyExtra) => {
     const createOrLoad = () => {
       if (playerRef.current && isReady.current && typeof playerRef.current.loadVideoById === 'function') {
-        const activeVideoId = playerRef.current.getVideoData?.()?.video_id;
-        if (activeVideoId !== videoId) {
+        const activeId = playerRef.current.getVideoData?.()?.video_id;
+        if (activeId !== videoId) {
           playerRef.current.loadVideoById({ videoId, suggestedQuality: 'hd720' });
         }
         return;
@@ -362,7 +310,7 @@ ${text}`
       if (playerRef.current) {
         try { playerRef.current.destroy(); } catch {}
         playerRef.current = null;
-        isReady.current = false;
+        isReady.current   = false;
       }
 
       playerRef.current = new window.YT.Player(playerContRef.current, {
@@ -375,9 +323,8 @@ ${text}`
         events: {
           onReady: (e) => {
             isReady.current = true;
-            // If this is the video-view for a JioSaavn song, mute the video —
-            // the JioSaavn <audio> element is already providing the sound.
-            if (isJioSaavn) {
+            // If showing video for a native-audio song → mute IFrame (audio already playing)
+            if (useNativeAudio) {
               e.target.mute();
             } else {
               e.target.unMute();
@@ -389,51 +336,38 @@ ${text}`
           },
           onStateChange: (e) => {
             if (e.data === window.YT.PlayerState.PLAYING) {
-              setIsPlaying(true);
-              startProgressTracking();
-              try { e.target.setPlaybackQuality('hd720'); } catch {}
-              if ('mediaSession' in navigator && !isJioSaavn) {
-                navigator.mediaSession.metadata = new window.MediaMetadata({
-                  title:   currentSongRef.current?.title  || '',
-                  artist:  currentSongRef.current?.artist || '',
-                  artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
-                });
-                navigator.mediaSession.playbackState = 'playing';
-                navigator.mediaSession.setActionHandler('play',          () => { playerRef.current?.playVideo(); setIsPlaying(true); });
-                navigator.mediaSession.setActionHandler('pause',         () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
-                navigator.mediaSession.setActionHandler('nexttrack',     () => playNextRef.current?.());
-                navigator.mediaSession.setActionHandler('previoustrack', () => playPrevRef.current?.());
-                navigator.mediaSession.setActionHandler('stop',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+              if (!useNativeAudio) {
+                // IFrame is the audio engine for this song
+                setIsPlaying(true);
+                startProgressTracking();
+                if ('mediaSession' in navigator) {
+                  navigator.mediaSession.metadata = new window.MediaMetadata({
+                    title:   currentSongRef.current?.title   || '',
+                    artist:  currentSongRef.current?.artist  || '',
+                    artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
+                  });
+                  navigator.mediaSession.playbackState = 'playing';
+                  navigator.mediaSession.setActionHandler('play',          () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+                  navigator.mediaSession.setActionHandler('pause',         () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+                  navigator.mediaSession.setActionHandler('nexttrack',     () => playNextRef.current?.());
+                  navigator.mediaSession.setActionHandler('previoustrack', () => playPrevRef.current?.());
+                }
               }
             } else if (e.data === window.YT.PlayerState.PAUSED) {
-              setIsPlaying(false);
-              stopProgressTracking();
-              if ('mediaSession' in navigator && !isJioSaavn) navigator.mediaSession.playbackState = 'paused';
+              if (!useNativeAudio) { setIsPlaying(false); stopProgressTracking(); }
             } else if (e.data === window.YT.PlayerState.ENDED) {
               stopProgressTracking();
               setProgress(0);
-              try {
-                playerRef.current.destroy();
-                playerRef.current = null;
-                isReady.current = false;
-              } catch {}
-              if (!isJioSaavn) {
-                // Only auto-advance the playlist if YouTube IS the primary
-                // engine for this song. If this was just the video-modal
-                // view of a JioSaavn song, the JioSaavn <audio> keeps going
-                // independently and we don't want to double-advance.
-                if (repeatRef.current === 'one') {
-                  playNextRef.current?.(); // MusicContext handles repeat-one via songKey bump
-                } else {
-                  playNextRef.current?.();
-                }
+              try { playerRef.current.destroy(); playerRef.current = null; isReady.current = false; } catch {}
+              if (!useNativeAudio) {
+                if (repeatRef.current === 'one') playNextRef.current?.();
+                else playNextRef.current?.();
               }
             }
           },
           onError: (e) => {
-            if (!isJioSaavn && (e.data === 101 || e.data === 150)) playNextRef.current?.();
-            else if (isJioSaavn) setVideoError('Video unavailable for this song.');
-            else setIsPlaying(false);
+            if (!useNativeAudio && (e.data === 101 || e.data === 150)) playNextRef.current?.();
+            else if (useNativeAudio) setVideoError('Video unavailable for this song.');
           }
         }
       });
@@ -441,57 +375,50 @@ ${text}`
 
     if (window.YT?.Player) createOrLoad();
     else window.onYouTubeIframeAPIReady = createOrLoad;
-  }, [volume, isJioSaavn]); // eslint-disable-line
-// ── Resolve YouTube audio URL via stream server ───────────────────
-// Runs when a YouTube song is selected — tries to get direct audio URL
-// Falls back silently to IFrame if stream server is unavailable
-useEffect(() => {
-  setResolvedYoutubeAudioUrl(null);
-  if (isJioSaavn || !currentSong?.youtube_id) return;
+  }, [volume, useNativeAudio]); // eslint-disable-line
 
-  setIsResolvingAudio(true);
-  axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`)
-    .then(({ data }) => {
-      if (data.ok && data.url) {
-        console.log('[Stream] ✅ Resolved YouTube audio for:', currentSong.title);
-        setResolvedYoutubeAudioUrl(data.url);
-      }
-    })
-    .catch(() => {
-      console.log('[Stream] Stream server unavailable, falling back to IFrame');
-    })
-    .finally(() => setIsResolvingAudio(false));
-}, [songKey, isJioSaavn, currentSong?.youtube_id]);
-  // ── Create / reload YouTube player when a YOUTUBE-sourced song changes ──
+  // ── IFrame audio fallback — only when stream server failed ───────────
+  // Wait for resolution attempt to complete before deciding to use IFrame
   useEffect(() => {
-   // Only use IFrame if native audio resolution failed or not yet resolved
-if (!currentSong || isJioSaavn || resolvedYoutubeAudioUrl) return;
-if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn songs use the audio engine instead
+    if (!currentSong || isJioSaavn)    return; // JioSaavn uses native audio always
+    if (isResolvingAudio)              return; // still trying stream server
+    if (resolvedAudioUrl)              return; // stream server worked, native audio active
+    // Stream server failed → use IFrame as audio engine
+    console.log('[IFrame] Stream server unavailable, using IFrame for:', currentSong.title);
     initYouTubePlayer(currentSong.youtube_id);
-  }, [songKey, isJioSaavn]); // eslint-disable-line
+  }, [songKey, isJioSaavn, isResolvingAudio, resolvedAudioUrl]); // eslint-disable-line
 
-  // ── Play / pause sync (YouTube engine only) ──────────────────────────────
+  // ── IFrame play/pause sync (only when IFrame is audio engine) ────────
   useEffect(() => {
     if (useNativeAudio) return;
     if (!playerRef.current || !isReady.current) return;
     if (isPlaying) {
       playerRef.current.unMute();
       playerRef.current.setVolume(volume);
-      const state = playerRef.current.getPlayerState?.();
-      if (state !== 1) playerRef.current.playVideo();
+      if (playerRef.current.getPlayerState?.() !== 1) playerRef.current.playVideo();
     } else {
       playerRef.current.pauseVideo();
     }
-  }, [isPlaying, isJioSaavn]); // eslint-disable-line
+  }, [isPlaying, useNativeAudio]); // eslint-disable-line
 
-  // ── Video button — lazy-load YouTube video for a JioSaavn song ──────────
+  // ── Video tab — lazy load YouTube video for any song ─────────────────
   const handleOpenVideo = async () => {
     setActiveTab('video');
-    if (!isJioSaavn) return; // YouTube songs already have the player ready
 
+    // YouTube song with native audio → show IFrame muted (audio continues)
+    if (!isJioSaavn && resolvedAudioUrl) {
+      initYouTubePlayer(currentSong.youtube_id, (e) => {
+        try { e.target.seekTo(audioRef.current.currentTime, true); } catch {}
+      });
+      return;
+    }
+
+    // YouTube song using IFrame already → IFrame already loaded
+    if (!isJioSaavn && !resolvedAudioUrl) return;
+
+    // JioSaavn song → lazy-resolve YouTube video ID
     if (resolvedYoutubeId) {
       initYouTubePlayer(resolvedYoutubeId, (e) => {
-        // Sync video to the current audio position
         try { e.target.seekTo(audioRef.current.currentTime, true); } catch {}
       });
       return;
@@ -500,94 +427,135 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
     setVideoLoading(true);
     setVideoError('');
     try {
-      const { data } = await axios.get(`${API}/api/songs/youtube-id/${currentSong._id}`);
+      const { data } = await axios.get(`${API}/api/search/youtube-id/${currentSong._id}`);
       setResolvedYoutubeId(data.youtube_id);
       initYouTubePlayer(data.youtube_id, (e) => {
         try { e.target.seekTo(audioRef.current.currentTime, true); } catch {}
       });
     } catch (err) {
-      setVideoError(err.response?.data?.message || 'Could not load video for this song.');
+      setVideoError(err.response?.data?.message || 'Could not load video.');
     } finally {
       setVideoLoading(false);
     }
   };
 
-  // ── Closing video tab for a JioSaavn song — stop YouTube, audio continues ──
-  const handleCloseVideoView = () => {
-    setActiveTab('lyrics');
-    if (isJioSaavn && playerRef.current) {
-      try { playerRef.current.pauseVideo(); } catch {}
-    }
+  // ── Lyrics ────────────────────────────────────────────────────────────
+  const hasDevanagari = (text) => /[\u0900-\u097F]/.test(text);
+
+  const transliterateToHinglish = async (text) => {
+    try {
+      const res = await axios.post(`${API}/api/search/transliterate`, { text });
+      return res.data?.result || text;
+    } catch { return text; }
   };
 
-  // ── Controls ────────────────────────────────────────────────────────────
-  const handleSeek = (e) => {
-    const clickX = e.nativeEvent.offsetX;
-    const width  = e.currentTarget.offsetWidth;
+  const parseSyncedLyrics = (lrc) => {
+    if (!lrc) return [];
+    return lrc.split('\n').map(line => {
+      const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+      if (!match) return null;
+      return { time: parseInt(match[1]) * 60 + parseFloat(match[2]), text: match[3].trim() };
+    }).filter(Boolean);
+  };
 
-    if (isJioSaavn) {
+  const fetchLyrics = useCallback(async (song) => {
+    if (!song) return;
+    setLyricsLoading(true);
+    setSyncedLines([]);
+    setPlainLyrics('');
+    setCurrentLineIndex(0);
+    setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5;
+    try {
+      const cleanTitle  = song.title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/\|.*/g, '').replace(/ft\.?.*/gi, '').replace(/feat\.?.*/gi, '').trim();
+      const aggTitle    = cleanTitle.replace(/\s*-\s*.*/g, '').replace(/official.*/gi, '').replace(/lyrics.*/gi, '').replace(/video.*/gi, '').replace(/hd.*/gi, '').replace(/full\s+song.*/gi, '').trim();
+      const cleanArtist = song.artist.replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '').replace(/official$/i, '').replace(/music$/i, '').trim();
+
+      const scoredMatch = (results, t, a) => {
+        if (!results?.length) return null;
+        const scored = results.map(r => {
+          let score = 0;
+          const rt = (r.trackName || '').toLowerCase();
+          const ra = (r.artistName || '').toLowerCase();
+          if (rt === t.toLowerCase()) score += 100;
+          else if (rt.includes(t.toLowerCase()) || t.toLowerCase().includes(rt)) score += 50;
+          if (ra === a.toLowerCase()) score += 40;
+          else if (ra.includes(a.toLowerCase()) || a.toLowerCase().includes(ra)) score += 20;
+          if (r.syncedLyrics) score += 10;
+          return { result: r, score };
+        }).sort((a, b) => b.score - a.score);
+        return scored[0].score > 0 ? scored[0].result : results[0];
+      };
+
+      const process = (match) => {
+        if (!match) return false;
+        if (match.syncedLyrics) { const lines = parseSyncedLyrics(match.syncedLyrics); if (lines.length > 0) { setSyncedLines(lines); return true; } }
+        if (match.plainLyrics)  { setPlainLyrics(match.plainLyrics); return true; }
+        return false;
+      };
+
+      let res;
+      res = await axios.get('https://lrclib.net/api/search', { params: { q: `${aggTitle} ${cleanArtist}` } });
+      if (res.data?.length > 0 && process(scoredMatch(res.data, aggTitle, cleanArtist))) return;
+      res = await axios.get('https://lrclib.net/api/search', { params: { q: aggTitle } });
+      if (res.data?.length > 0 && process(scoredMatch(res.data, aggTitle, cleanArtist))) return;
+      res = await axios.get('https://lrclib.net/api/search', { params: { q: `${cleanTitle} ${cleanArtist}` } });
+      if (res.data?.length > 0 && process(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+      res = await axios.get('https://lrclib.net/api/get', { params: { track_name: aggTitle, artist_name: cleanArtist } });
+      if (res.data && process(res.data)) return;
+      setPlainLyrics('Lyrics not found for this song.');
+    } catch { setPlainLyrics('Could not load lyrics.'); }
+    finally  { setLyricsLoading(false); }
+  }, []);
+
+  useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+  // ── Controls ──────────────────────────────────────────────────────────
+  const handleSeek = (e) => {
+    const pct = e.nativeEvent.offsetX / e.currentTarget.offsetWidth;
+    if (useNativeAudio) {
       const audio = audioRef.current;
-      const total = audio.duration;
-      if (total > 0) audio.currentTime = (clickX / width) * total;
+      if (audio.duration > 0) audio.currentTime = pct * audio.duration;
     } else {
       if (!playerRef.current || !isReady.current) return;
       const total = playerRef.current.getDuration();
-      if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+      if (total > 0) playerRef.current.seekTo(pct * total, true);
     }
   };
 
   const handleVolumeChange = (e) => {
     const val = parseInt(e.target.value);
     setVolume(val);
-    if (isJioSaavn) {
-      audioRef.current.volume = val === 0 ? 0 : val / 100;
-      setIsMuted(val === 0);
+    setIsMuted(val === 0);
+    if (useNativeAudio) {
+      audioRef.current.volume = val / 100;
     } else if (playerRef.current && isReady.current) {
       playerRef.current.setVolume(val);
-      if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
-      else           { playerRef.current.unMute(); setIsMuted(false); }
+      if (val === 0) playerRef.current.mute(); else playerRef.current.unMute();
     }
   };
 
   const toggleMute = () => {
-    if (isJioSaavn) {
+    if (useNativeAudio) {
       setIsMuted(prev => {
-        const next = !prev;
-        audioRef.current.volume = next ? 0 : (volume || 100) / 100;
-        return next;
+        audioRef.current.volume = !prev ? 0 : volume / 100;
+        return !prev;
       });
     } else {
       if (!playerRef.current || !isReady.current) return;
-      if (isMuted) {
-        playerRef.current.unMute();
-        playerRef.current.setVolume(volume || 100);
-        setIsMuted(false);
-      } else {
-        playerRef.current.mute();
-        setIsMuted(true);
-      }
+      if (isMuted) { playerRef.current.unMute(); playerRef.current.setVolume(volume); setIsMuted(false); }
+      else         { playerRef.current.mute(); setIsMuted(true); }
     }
   };
 
   const handleFullscreen = () => {
-    const el = videoWrapperRef.current;
-    if (!el) return;
-    const isFull = document.fullscreenElement || document.webkitFullscreenElement
-      || document.mozFullScreenElement || document.msFullscreenElement;
-    if (isFull) {
-      if (document.exitFullscreen) document.exitFullscreen();
-      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-      else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
-      else if (document.msExitFullscreen) document.msExitFullscreen();
-    } else {
-      if (el.requestFullscreen) el.requestFullscreen();
-      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
-      else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
-      else if (el.msRequestFullscreen) el.msRequestFullscreen();
-    }
+    const el   = videoWrapperRef.current;
+    if (!el)   return;
+    const full = document.fullscreenElement || document.webkitFullscreenElement;
+    if (full)  { (document.exitFullscreen || document.webkitExitFullscreen)?.call(document); }
+    else       { (el.requestFullscreen    || el.webkitRequestFullscreen)?.call(el); }
   };
 
-  // ── Lyrics renderer ─────────────────────────────────────────────────────
+  // ── Lyrics renderer ───────────────────────────────────────────────────
   const renderLyrics = () => {
     if (lyricsLoading) return (
       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
@@ -595,25 +563,26 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
         <div>Loading lyrics...</div>
       </div>
     );
+
     if (syncedLines.length > 0) {
-      const startIdx = Math.max(0, currentLineIndex - 1);
+      const startIdx    = Math.max(0, currentLineIndex - 1);
       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
       return (
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: '18px', padding: '20px' }}>
           {visibleLines.map((line, i) => {
-            const globalIndex = startIdx + i;
-            const isCurrent = globalIndex === currentLineIndex;
-            const isNext    = globalIndex === currentLineIndex + 1;
-            const isPast    = globalIndex < currentLineIndex;
+            const gi        = startIdx + i;
+            const isCurrent = gi === currentLineIndex;
+            const isNext    = gi === currentLineIndex + 1;
+            const isPast    = gi < currentLineIndex;
             return (
-              <div key={globalIndex} style={{
-                textAlign: 'center',
-                fontSize: isCurrent ? '1.5rem' : '1.1rem',
+              <div key={gi} style={{
+                textAlign: 'center', lineHeight: '1.5',
+                fontSize:  isCurrent ? '1.5rem' : '1.1rem',
                 fontWeight: isCurrent ? 'bold' : 'normal',
-                color: isCurrent ? '#1db954' : isNext ? '#ffffff' : isPast ? '#555' : '#888',
-                transition: 'all 0.3s ease', lineHeight: '1.5',
-                opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+                color:     isCurrent ? '#1db954' : isNext ? '#ffffff' : isPast ? '#555' : '#888',
+                opacity:   isCurrent ? 1 : isNext ? 0.85 : 0.4,
                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+                transition: 'all 0.3s ease'
               }}>
                 {line.text || ' '}
               </div>
@@ -625,10 +594,11 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
         </div>
       );
     }
+
     return (
       <div style={{ padding: '10px 20px', textAlign: 'center' }}>
         {plainLyrics.split('\n').map((line, i) => (
-          <p key={i} style={{ margin: '0', color: line.trim() ? '#ddd' : 'transparent', fontSize: 'clamp(0.88rem, 2.5vw, 1rem)', lineHeight: '2', minHeight: '2rem', fontWeight: line.trim() ? '400' : 'normal' }}>
+          <p key={i} style={{ margin: 0, color: line.trim() ? '#ddd' : 'transparent', fontSize: 'clamp(0.88rem, 2.5vw, 1rem)', lineHeight: '2', minHeight: '2rem' }}>
             {line.trim() || '\u00a0'}
           </p>
         ))}
@@ -638,33 +608,37 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
 
   if (!currentSong) return null;
 
+  // ── Source badge for debugging (remove in production if desired) ──────
+  const sourceBadge = isJioSaavn
+    ? { label: 'JioSaavn', color: '#1db954' }
+    : resolvedAudioUrl
+      ? { label: 'YT Native', color: '#ff6b35' }
+      : isResolvingAudio
+        ? { label: 'Resolving...', color: '#888' }
+        : { label: 'YT IFrame', color: '#ff0000' };
+
   return (
     <>
-      {/* ── MODAL ── */}
+      {/* ════════════════════════════════════════════════════════════════
+          MODAL
+      ════════════════════════════════════════════════════════════════ */}
       <div style={{
         position: 'fixed', inset: 0, zIndex: 2000,
         background: 'rgba(0,0,0,0.96)', display: 'flex', flexDirection: 'column',
         visibility: showModal ? 'visible' : 'hidden',
         pointerEvents: showModal ? 'all' : 'none'
       }}>
+        {/* Modal header */}
         <div style={{ display: 'flex', alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid #333', gap: '10px', flexWrap: 'nowrap', minWidth: 0 }}>
           <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
             <div style={{ fontWeight: 'bold', fontSize: 'clamp(0.82rem, 2.5vw, 1rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
             <div style={{ color: '#b3b3b3', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
           </div>
           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
-            <button onClick={() => setActiveTab('lyrics')} style={{
-              padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
-              background: activeTab === 'lyrics' ? '#1db954' : '#333', color: 'white',
-              display: 'flex', alignItems: 'center', gap: '5px', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)'
-            }}>
+            <button onClick={() => setActiveTab('lyrics')} style={{ padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer', background: activeTab === 'lyrics' ? '#1db954' : '#333', color: 'white', display: 'flex', alignItems: 'center', gap: '5px', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)' }}>
               <Music size={13} /> <span>Lyrics</span>
             </button>
-            <button onClick={handleOpenVideo} style={{
-              padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
-              background: activeTab === 'video' ? '#1db954' : '#333', color: 'white',
-              display: 'flex', alignItems: 'center', gap: '5px', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)'
-            }}>
+            <button onClick={handleOpenVideo} style={{ padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer', background: activeTab === 'video' ? '#1db954' : '#333', color: 'white', display: 'flex', alignItems: 'center', gap: '5px', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)' }}>
               <Tv size={13} /> <span>Video</span>
             </button>
           </div>
@@ -729,19 +703,19 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
                     onClick={async () => {
                       if (translitMode === 'original') {
                         setTranslitMode('loading');
-                        const lyricsText = syncedLines.length > 0 ? syncedLines.map(l => l.text).join('\n') : plainLyrics;
-                        const result = await transliterateToHinglish(lyricsText);
-                        const lines = result.split('\n');
-                        if (syncedLines.length > 0) {
-                          setSyncedLines(prev => prev.map((l, i) => ({ ...l, text: lines[i] || l.text })));
-                        } else { setPlainLyrics(result); }
+                        const txt    = syncedLines.length > 0 ? syncedLines.map(l => l.text).join('\n') : plainLyrics;
+                        const result = await transliterateToHinglish(txt);
+                        const lines  = result.split('\n');
+                        if (syncedLines.length > 0) setSyncedLines(prev => prev.map((l, i) => ({ ...l, text: lines[i] || l.text })));
+                        else setPlainLyrics(result);
                         setTranslitMode('hinglish');
-                      } else if (translitMode === 'hinglish') {
-                        fetchLyrics(currentSong); setTranslitMode('original');
+                      } else {
+                        fetchLyrics(currentSong);
+                        setTranslitMode('original');
                       }
                     }}
                     disabled={translitMode === 'loading'}
-                    style={{ flexShrink: 0, padding: '6px 12px', borderRadius: '20px', border: 'none', cursor: translitMode === 'loading' ? 'wait' : 'pointer', background: translitMode === 'hinglish' ? '#1db954' : '#333', color: 'white', fontSize: '0.75rem', fontWeight: 600, whiteSpace: 'nowrap' }}
+                    style={{ flexShrink: 0, padding: '6px 12px', borderRadius: '20px', border: 'none', cursor: translitMode === 'loading' ? 'wait' : 'pointer', background: translitMode === 'hinglish' ? '#1db954' : '#333', color: 'white', fontSize: '0.75rem', fontWeight: 600 }}
                   >
                     {translitMode === 'loading' ? '...' : translitMode === 'hinglish' ? 'अ Original' : 'A Hinglish'}
                   </button>
@@ -751,9 +725,7 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px', background: '#1e1e1e', borderRadius: '20px', padding: '6px 14px' }}>
                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
                   <button onClick={() => setLyricsOffset(prev => { const v = Math.round((prev - 0.5) * 10) / 10; lyricsOffsetRef.current = v; return v; })} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '26px', height: '26px', cursor: 'pointer', color: 'white', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>−</button>
-                  <span style={{ color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954', fontSize: '0.82rem', minWidth: '48px', textAlign: 'center' }}>
-                    {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
-                  </span>
+                  <span style={{ color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954', fontSize: '0.82rem', minWidth: '48px', textAlign: 'center' }}>{lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}</span>
                   <button onClick={() => setLyricsOffset(prev => { const v = Math.round((prev + 0.5) * 10) / 10; lyricsOffsetRef.current = v; return v; })} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '26px', height: '26px', cursor: 'pointer', color: 'white', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
                   {lyricsOffset !== 1.5 && (
                     <button onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }} style={{ background: 'transparent', border: 'none', color: '#666', cursor: 'pointer', fontSize: '0.75rem' }}>Reset</button>
@@ -767,7 +739,7 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
           )}
         </div>
 
-        {/* Footer controls */}
+        {/* Modal footer controls */}
         <div style={{ padding: '12px 24px 20px', borderTop: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
             <Shuffle size={18} onClick={toggleShuffle} style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
@@ -787,7 +759,9 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
         </div>
       </div>
 
-      {/* ── PLAYER BAR ── */}
+      {/* ════════════════════════════════════════════════════════════════
+          PLAYER BAR
+      ════════════════════════════════════════════════════════════════ */}
       <div className="player-bar">
         <div className="player-info" style={{ cursor: 'pointer' }} onClick={() => { setShowModal(true); setActiveTab('lyrics'); }}>
           <div style={{ position: 'relative' }}>
@@ -801,7 +775,13 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
             <div className="song-title">{currentSong.title}</div>
             <div className="song-artist">{currentSong.artist}</div>
             {queue.length > 0 && currentIndex >= 0 && (
-              <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>{currentIndex + 1} / {queue.length} in playlist</div>
+              <div style={{ fontSize: '11px', marginTop: '2px', display: 'flex', gap: '6px', alignItems: 'center' }}>
+                <span style={{ color: '#1db954' }}>{currentIndex + 1} / {queue.length} in playlist</span>
+                {/* Source badge — shows how audio is being delivered */}
+                <span style={{ color: sourceBadge.color, fontSize: '10px', background: 'rgba(255,255,255,0.08)', padding: '1px 5px', borderRadius: '4px' }}>
+                  {sourceBadge.label}
+                </span>
+              </div>
             )}
           </div>
         </div>
@@ -819,7 +799,7 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
               {repeat !== 'none' && <div style={{ position: 'absolute', bottom: '-4px', left: '50%', transform: 'translateX(-50%)', width: '4px', height: '4px', borderRadius: '50%', background: '#1db954' }} />}
             </div>
           </div>
-          <div onClick={handleSeek} style={{ width: '100%', height: '4px', background: '#444', borderRadius: '2px', cursor: 'pointer', position: 'relative' }}>
+          <div onClick={handleSeek} style={{ width: '100%', height: '4px', background: '#444', borderRadius: '2px', cursor: 'pointer' }}>
             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
           </div>
         </div>
@@ -836,6 +816,866 @@ if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn so
 };
 
 export default PlayerBar;
+
+
+
+
+
+
+
+//youtube only 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const API = process.env.REACT_APP_API_URL || '';
+// // ── Stream server for YouTube audio resolution ─────────────────────
+// const STREAM_SERVER = 'https://rancidity-retrain-glacier.ngrok-free.dev';
+// const [resolvedYoutubeAudioUrl, setResolvedYoutubeAudioUrl] = useState(null);
+// const [isResolvingAudio, setIsResolvingAudio]               = useState(false);
+// // True when YouTube song has been resolved to native audio URL
+// // In this case we use the same HTML5 <audio> engine as JioSaavn
+// const useNativeAudio = isJioSaavn || !!resolvedYoutubeAudioUrl;
+
+// const PlayerBar = () => {
+//   const { currentSong, songKey, isPlaying, togglePlay, setIsPlaying, playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat } = useContext(MusicContext);
+
+//   // ── Persistent References to Bypass Closures ───────────────────────────
+//   const playNextRef    = useRef(null);
+//   const playPrevRef    = useRef(null);
+//   const currentSongRef = useRef(null);
+//   const repeatRef      = useRef(repeat);
+
+//   useEffect(() => { playNextRef.current    = playNext;    }, [playNext]);
+//   useEffect(() => { playPrevRef.current    = playPrev;    }, [playPrev]);
+//   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
+//   useEffect(() => { repeatRef.current      = repeat;      }, [repeat]);
+
+//   // ── Native HTML5 audio — PRIMARY engine for JioSaavn songs ──────────────
+//   const audioRef = useRef(new Audio());
+
+//   // ── YouTube IFrame — used for YouTube-sourced songs + video modal ───────
+//   const playerRef       = useRef(null);
+//   const playerContRef   = useRef(null);
+//   const videoWrapperRef = useRef(null);
+//   const isReady         = useRef(false);
+
+//   const [progress, setProgress]                   = useState(0);
+//   const [volume, setVolume]                       = useState(100);
+//   const [isMuted, setIsMuted]                     = useState(false);
+//   const [showModal, setShowModal]                 = useState(false);
+//   const [isFullscreen, setIsFullscreen]           = useState(false);
+//   const [activeTab, setActiveTab]                 = useState('lyrics'); // default to lyrics, video is on-demand
+//   const [syncedLines, setSyncedLines]             = useState([]);
+//   const [plainLyrics, setPlainLyrics]             = useState('');
+//   const [lyricsLoading, setLyricsLoading]         = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex]   = useState(0);
+//   const [lyricsOffset, setLyricsOffset]           = useState(1.5);
+//   const [isTransliterating, setIsTransliterating] = useState(false);
+//   const [translitMode, setTranslitMode]           = useState('original');
+//   const [videoLoading, setVideoLoading]           = useState(false);
+//   const [videoError, setVideoError]               = useState('');
+//   const [resolvedYoutubeId, setResolvedYoutubeId] = useState(null);
+//   const progressInterval = useRef(null);
+//   const lyricsOffsetRef  = useRef(1.5);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev = currentIndex > 0;
+//   const hasNext = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   const isJioSaavn = currentSong?.source === 'jiosaavn';
+
+//   // ── Lyrics ─────────────────────────────────────────────────────────────
+//   const hasDevanagari = (text) => /[\u0900-\u097F]/.test(text);
+
+//   const transliterateToHinglish = async (text) => {
+//     setIsTransliterating(true);
+//     try {
+//       const response = await fetch('https://api.anthropic.com/v1/messages', {
+//         method: 'POST',
+//         headers: { 'Content-Type': 'application/json' },
+//         body: JSON.stringify({
+//           model: 'claude-sonnet-4-20250514',
+//           max_tokens: 1000,
+//           messages: [{
+//             role: 'user',
+//             content: `Transliterate these Hindi/Devanagari song lyrics to Hinglish (Roman script). 
+// Rules:
+// - Keep English words/lines exactly as they are
+// - Transliterate Hindi words to how they sound in Roman/English letters
+// - Keep line breaks exactly the same
+// - Do not translate — only transliterate the pronunciation
+// - Return ONLY the transliterated lyrics, nothing else
+
+// Lyrics:
+// ${text}`
+//           }]
+//         })
+//       });
+//       const data = await response.json();
+//       return data.content?.[0]?.text || text;
+//     } catch (err) {
+//       console.error('Transliteration error:', err);
+//       return text;
+//     } finally {
+//       setIsTransliterating(false);
+//     }
+//   };
+
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n')
+//       .map(line => {
+//         const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//         if (!match) return null;
+//         const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//         return { time, text: match[3].trim() };
+//       })
+//       .filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5;
+//     try {
+//       const cleanTitle = song.title
+//         .replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '')
+//         .replace(/\|.*/g, '').replace(/ft\.?.*/gi, '')
+//         .replace(/feat\.?.*/gi, '').trim();
+
+//       const aggressiveTitle = cleanTitle
+//         .replace(/\s*-\s*.*/g, '').replace(/official.*/gi, '')
+//         .replace(/lyrics.*/gi, '').replace(/video.*/gi, '')
+//         .replace(/hd.*/gi, '').replace(/full\s+song.*/gi, '').trim();
+
+//       const cleanArtist = song.artist
+//         .replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '')
+//         .replace(/official$/i, '').replace(/music$/i, '').trim();
+
+//       const scoredMatch = (results, targetTitle, targetArtist) => {
+//         if (!results?.length) return null;
+//         const t = targetTitle.toLowerCase();
+//         const a = targetArtist.toLowerCase();
+//         const scored = results.map(r => {
+//           let score = 0;
+//           const rt = (r.trackName || '').toLowerCase();
+//           const ra = (r.artistName || '').toLowerCase();
+//           if (rt === t) score += 100;
+//           else if (rt.includes(t) || t.includes(rt)) score += 50;
+//           if (ra === a) score += 40;
+//           else if (ra.includes(a) || a.includes(ra)) score += 20;
+//           if (r.syncedLyrics) score += 10;
+//           return { result: r, score };
+//         });
+//         scored.sort((a, b) => b.score - a.score);
+//         return scored[0].score > 0 ? scored[0].result : results[0];
+//       };
+
+//       const processResult = (match) => {
+//         if (!match) return false;
+//         if (match.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       let res = await axios.get('https://lrclib.net/api/search', { params: { q: `${aggressiveTitle} ${cleanArtist}` } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: aggressiveTitle } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: `${cleanTitle} ${cleanArtist}` } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: cleanTitle } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/get', { params: { track_name: aggressiveTitle, artist_name: cleanArtist } });
+//       if (res.data && processResult(res.data)) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: song.title } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, song.title, cleanArtist))) return;
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ── Reset video state whenever song changes ─────────────────────────────
+//   useEffect(() => {
+//     setResolvedYoutubeId(null);
+//     setVideoError('');
+//     setActiveTab('lyrics'); // always start on lyrics — video is opt-in
+//   }, [currentSong?._id]);
+
+//   // ═══════════════════════════════════════════════════════════════════════
+//   // ── PRIMARY AUDIO ENGINE — HTML5 <audio> for JioSaavn songs ─────────────
+//   // This is what survives backgrounding — real native audio, no YouTube
+//   // player restrictions apply here at all.
+//   // ═══════════════════════════════════════════════════════════════════════
+//   useEffect(() => {
+//   if (!currentSong || !useNativeAudio) return;
+
+//     const audio = audioRef.current;
+//    // JioSaavn uses direct CDN URL; YouTube uses stream-server resolved URL
+//     audio.src = isJioSaavn ? currentSong.stream_url : resolvedYoutubeAudioUrl;
+//     audio.volume = isMuted ? 0 : volume / 100;
+//     audio.load();
+
+//     const tryPlay = () => { audio.play().catch(() => {}); };
+//     if (isPlaying) tryPlay();
+
+//     const handleTimeUpdate = () => {
+//       const cur = audio.currentTime;
+//       const total = audio.duration;
+//       if (total > 0) setProgress((cur / total) * 100);
+//       setSyncedLines(prev => {
+//         if (prev.length === 0) return prev;
+//         let idx = 0;
+//         for (let i = 0; i < prev.length; i++) {
+//           if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i;
+//           else break;
+//         }
+//         setCurrentLineIndex(idx);
+//         return prev;
+//       });
+//     };
+
+//     const registerMediaSession = () => {
+//       if (!('mediaSession' in navigator)) return;
+//       navigator.mediaSession.metadata = new window.MediaMetadata({
+//         title:   currentSongRef.current?.title  || '',
+//         artist:  currentSongRef.current?.artist || '',
+//         artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
+//       });
+//       navigator.mediaSession.setActionHandler('play',          () => { audio.play().catch(() => {}); setIsPlaying(true); });
+//       navigator.mediaSession.setActionHandler('pause',         () => { audio.pause(); setIsPlaying(false); });
+//       navigator.mediaSession.setActionHandler('nexttrack',     () => playNextRef.current?.());
+//       navigator.mediaSession.setActionHandler('previoustrack', () => playPrevRef.current?.());
+//       navigator.mediaSession.setActionHandler('stop',          () => { audio.pause(); setIsPlaying(false); });
+//     };
+
+//     const handlePlay  = () => { setIsPlaying(true);  registerMediaSession(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing'; };
+//     const handlePause = () => { setIsPlaying(false); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused'; };
+//     const handleEnded = () => {
+//       setProgress(0);
+//       if (repeatRef.current === 'one') {
+//         audio.currentTime = 0;
+//         audio.play().catch(() => {});
+//         setIsPlaying(true);
+//       } else {
+//         playNextRef.current?.();
+//       }
+//     };
+//     const handleError = () => {
+//       console.warn('JioSaavn audio failed to load, skipping to next');
+//       playNextRef.current?.();
+//     };
+
+//     audio.addEventListener('timeupdate', handleTimeUpdate);
+//     audio.addEventListener('play', handlePlay);
+//     audio.addEventListener('pause', handlePause);
+//     audio.addEventListener('ended', handleEnded);
+//     audio.addEventListener('error', handleError);
+
+//     registerMediaSession();
+
+//     return () => {
+//       audio.removeEventListener('timeupdate', handleTimeUpdate);
+//       audio.removeEventListener('play', handlePlay);
+//       audio.removeEventListener('pause', handlePause);
+//       audio.removeEventListener('ended', handleEnded);
+//       audio.removeEventListener('error', handleError);
+//     };
+//   }, [songKey, isJioSaavn]); // eslint-disable-line
+
+//   // Sync play/pause + volume for the native audio engine
+//   useEffect(() => {
+//     if (!useNativeAudio) return;
+//     const audio = audioRef.current;
+//     if (isPlaying) audio.play().catch(() => {});
+//     else audio.pause();
+//   }, [isPlaying, isJioSaavn]);
+
+//   useEffect(() => {
+//     if (!useNativeAudio) return;
+//     audioRef.current.volume = isMuted ? 0 : volume / 100;
+//   }, [volume, isMuted, isJioSaavn]);
+
+//   // ── Fully stop native audio whenever a YouTube song takes over ──────────
+//   useEffect(() => {
+//     if (!useNativeAudio) {
+//       try {
+//         const audio = audioRef.current;
+//         audio.pause();
+//         audio.currentTime = 0;
+//         audio.src = ''; // fully release — prevents any lingering buffered audio
+//       } catch {}
+//     }
+//   }, [isJioSaavn, songKey]);
+
+//   // ── Progress tracking (YouTube engine only) ──────────────────────────────
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         setSyncedLines(prev => {
+//           if (prev.length === 0) return prev;
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i;
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300);
+//   };
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // ── Fullscreen tracking ───────────────────────────────────────────────
+//   useEffect(() => {
+//     const onChange = () => {
+//       const full = !!(document.fullscreenElement || document.webkitFullscreenElement
+//         || document.mozFullScreenElement || document.msFullscreenElement);
+//       setIsFullscreen(full);
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   // ── Load YouTube IFrame API once ────────────────────────────────────────
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag = document.createElement('script');
+//     tag.src = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── YOUTUBE ENGINE — used when song.source === 'youtube' ────────────────
+//   // (also reused for on-demand video playback of JioSaavn songs, see below)
+//   const initYouTubePlayer = useCallback((videoId, onReadyExtra) => {
+//     const createOrLoad = () => {
+//       if (playerRef.current && isReady.current && typeof playerRef.current.loadVideoById === 'function') {
+//         const activeVideoId = playerRef.current.getVideoData?.()?.video_id;
+//         if (activeVideoId !== videoId) {
+//           playerRef.current.loadVideoById({ videoId, suggestedQuality: 'hd720' });
+//         }
+//         return;
+//       }
+
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId,
+//         playerVars: {
+//           autoplay: 1, controls: 0, disablekb: 1, fs: 0,
+//           iv_load_policy: 3, modestbranding: 1, rel: 0,
+//           playsinline: 1, origin: window.location.origin, vq: 'hd720'
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             // If this is the video-view for a JioSaavn song, mute the video —
+//             // the JioSaavn <audio> element is already providing the sound.
+//             if (isJioSaavn) {
+//               e.target.mute();
+//             } else {
+//               e.target.unMute();
+//               e.target.setVolume(volume);
+//             }
+//             e.target.setPlaybackQuality('hd720');
+//             e.target.playVideo();
+//             onReadyExtra?.(e);
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               setIsPlaying(true);
+//               startProgressTracking();
+//               try { e.target.setPlaybackQuality('hd720'); } catch {}
+//               if ('mediaSession' in navigator && !isJioSaavn) {
+//                 navigator.mediaSession.metadata = new window.MediaMetadata({
+//                   title:   currentSongRef.current?.title  || '',
+//                   artist:  currentSongRef.current?.artist || '',
+//                   artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
+//                 });
+//                 navigator.mediaSession.playbackState = 'playing';
+//                 navigator.mediaSession.setActionHandler('play',          () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                 navigator.mediaSession.setActionHandler('pause',         () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                 navigator.mediaSession.setActionHandler('nexttrack',     () => playNextRef.current?.());
+//                 navigator.mediaSession.setActionHandler('previoustrack', () => playPrevRef.current?.());
+//                 navigator.mediaSession.setActionHandler('stop',          () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               setIsPlaying(false);
+//               stopProgressTracking();
+//               if ('mediaSession' in navigator && !isJioSaavn) navigator.mediaSession.playbackState = 'paused';
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               try {
+//                 playerRef.current.destroy();
+//                 playerRef.current = null;
+//                 isReady.current = false;
+//               } catch {}
+//               if (!isJioSaavn) {
+//                 // Only auto-advance the playlist if YouTube IS the primary
+//                 // engine for this song. If this was just the video-modal
+//                 // view of a JioSaavn song, the JioSaavn <audio> keeps going
+//                 // independently and we don't want to double-advance.
+//                 if (repeatRef.current === 'one') {
+//                   playNextRef.current?.(); // MusicContext handles repeat-one via songKey bump
+//                 } else {
+//                   playNextRef.current?.();
+//                 }
+//               }
+//             }
+//           },
+//           onError: (e) => {
+//             if (!isJioSaavn && (e.data === 101 || e.data === 150)) playNextRef.current?.();
+//             else if (isJioSaavn) setVideoError('Video unavailable for this song.');
+//             else setIsPlaying(false);
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) createOrLoad();
+//     else window.onYouTubeIframeAPIReady = createOrLoad;
+//   }, [volume, isJioSaavn]); // eslint-disable-line
+// // ── Resolve YouTube audio URL via stream server ───────────────────
+// // Runs when a YouTube song is selected — tries to get direct audio URL
+// // Falls back silently to IFrame if stream server is unavailable
+// useEffect(() => {
+//   setResolvedYoutubeAudioUrl(null);
+//   if (isJioSaavn || !currentSong?.youtube_id) return;
+
+//   setIsResolvingAudio(true);
+//   axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`)
+//     .then(({ data }) => {
+//       if (data.ok && data.url) {
+//         console.log('[Stream] ✅ Resolved YouTube audio for:', currentSong.title);
+//         setResolvedYoutubeAudioUrl(data.url);
+//       }
+//     })
+//     .catch(() => {
+//       console.log('[Stream] Stream server unavailable, falling back to IFrame');
+//     })
+//     .finally(() => setIsResolvingAudio(false));
+// }, [songKey, isJioSaavn, currentSong?.youtube_id]);
+//   // ── Create / reload YouTube player when a YOUTUBE-sourced song changes ──
+//   useEffect(() => {
+//    // Only use IFrame if native audio resolution failed or not yet resolved
+// if (!currentSong || isJioSaavn || resolvedYoutubeAudioUrl) return;
+// if (isResolvingAudio) return; // wait for resolution attempt first// JioSaavn songs use the audio engine instead
+//     initYouTubePlayer(currentSong.youtube_id);
+//   }, [songKey, isJioSaavn]); // eslint-disable-line
+
+//   // ── Play / pause sync (YouTube engine only) ──────────────────────────────
+//   useEffect(() => {
+//     if (useNativeAudio) return;
+//     if (!playerRef.current || !isReady.current) return;
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       const state = playerRef.current.getPlayerState?.();
+//       if (state !== 1) playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying, isJioSaavn]); // eslint-disable-line
+
+//   // ── Video button — lazy-load YouTube video for a JioSaavn song ──────────
+//   const handleOpenVideo = async () => {
+//     setActiveTab('video');
+//     if (!isJioSaavn) return; // YouTube songs already have the player ready
+
+//     if (resolvedYoutubeId) {
+//       initYouTubePlayer(resolvedYoutubeId, (e) => {
+//         // Sync video to the current audio position
+//         try { e.target.seekTo(audioRef.current.currentTime, true); } catch {}
+//       });
+//       return;
+//     }
+
+//     setVideoLoading(true);
+//     setVideoError('');
+//     try {
+//       const { data } = await axios.get(`${API}/api/songs/youtube-id/${currentSong._id}`);
+//       setResolvedYoutubeId(data.youtube_id);
+//       initYouTubePlayer(data.youtube_id, (e) => {
+//         try { e.target.seekTo(audioRef.current.currentTime, true); } catch {}
+//       });
+//     } catch (err) {
+//       setVideoError(err.response?.data?.message || 'Could not load video for this song.');
+//     } finally {
+//       setVideoLoading(false);
+//     }
+//   };
+
+//   // ── Closing video tab for a JioSaavn song — stop YouTube, audio continues ──
+//   const handleCloseVideoView = () => {
+//     setActiveTab('lyrics');
+//     if (isJioSaavn && playerRef.current) {
+//       try { playerRef.current.pauseVideo(); } catch {}
+//     }
+//   };
+
+//   // ── Controls ────────────────────────────────────────────────────────────
+//   const handleSeek = (e) => {
+//     const clickX = e.nativeEvent.offsetX;
+//     const width  = e.currentTarget.offsetWidth;
+
+//     if (isJioSaavn) {
+//       const audio = audioRef.current;
+//       const total = audio.duration;
+//       if (total > 0) audio.currentTime = (clickX / width) * total;
+//     } else {
+//       if (!playerRef.current || !isReady.current) return;
+//       const total = playerRef.current.getDuration();
+//       if (total > 0) playerRef.current.seekTo((clickX / width) * total, true);
+//     }
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (isJioSaavn) {
+//       audioRef.current.volume = val === 0 ? 0 : val / 100;
+//       setIsMuted(val === 0);
+//     } else if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (isJioSaavn) {
+//       setIsMuted(prev => {
+//         const next = !prev;
+//         audioRef.current.volume = next ? 0 : (volume || 100) / 100;
+//         return next;
+//       });
+//     } else {
+//       if (!playerRef.current || !isReady.current) return;
+//       if (isMuted) {
+//         playerRef.current.unMute();
+//         playerRef.current.setVolume(volume || 100);
+//         setIsMuted(false);
+//       } else {
+//         playerRef.current.mute();
+//         setIsMuted(true);
+//       }
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     const isFull = document.fullscreenElement || document.webkitFullscreenElement
+//       || document.mozFullScreenElement || document.msFullscreenElement;
+//     if (isFull) {
+//       if (document.exitFullscreen) document.exitFullscreen();
+//       else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+//       else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+//       else if (document.msExitFullscreen) document.msExitFullscreen();
+//     } else {
+//       if (el.requestFullscreen) el.requestFullscreen();
+//       else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+//       else if (el.mozRequestFullScreen) el.mozRequestFullScreen();
+//       else if (el.msRequestFullscreen) el.msRequestFullscreen();
+//     }
+//   };
+
+//   // ── Lyrics renderer ─────────────────────────────────────────────────────
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+//     if (syncedLines.length > 0) {
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visibleLines = syncedLines.slice(startIdx, startIdx + 4);
+//       return (
+//         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: '18px', padding: '20px' }}>
+//           {visibleLines.map((line, i) => {
+//             const globalIndex = startIdx + i;
+//             const isCurrent = globalIndex === currentLineIndex;
+//             const isNext    = globalIndex === currentLineIndex + 1;
+//             const isPast    = globalIndex < currentLineIndex;
+//             return (
+//               <div key={globalIndex} style={{
+//                 textAlign: 'center',
+//                 fontSize: isCurrent ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCurrent ? 'bold' : 'normal',
+//                 color: isCurrent ? '#1db954' : isNext ? '#ffffff' : isPast ? '#555' : '#888',
+//                 transition: 'all 0.3s ease', lineHeight: '1.5',
+//                 opacity: isCurrent ? 1 : isNext ? 0.85 : 0.4,
+//                 transform: isCurrent ? 'scale(1.05)' : 'scale(1)',
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+//     return (
+//       <div style={{ padding: '10px 20px', textAlign: 'center' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{ margin: '0', color: line.trim() ? '#ddd' : 'transparent', fontSize: 'clamp(0.88rem, 2.5vw, 1rem)', lineHeight: '2', minHeight: '2rem', fontWeight: line.trim() ? '400' : 'normal' }}>
+//             {line.trim() || '\u00a0'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   return (
+//     <>
+//       {/* ── MODAL ── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)', display: 'flex', flexDirection: 'column',
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         <div style={{ display: 'flex', alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid #333', gap: '10px', flexWrap: 'nowrap', minWidth: 0 }}>
+//           <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+//             <div style={{ fontWeight: 'bold', fontSize: 'clamp(0.82rem, 2.5vw, 1rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
+//           </div>
+//           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+//             <button onClick={() => setActiveTab('lyrics')} style={{
+//               padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//               background: activeTab === 'lyrics' ? '#1db954' : '#333', color: 'white',
+//               display: 'flex', alignItems: 'center', gap: '5px', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)'
+//             }}>
+//               <Music size={13} /> <span>Lyrics</span>
+//             </button>
+//             <button onClick={handleOpenVideo} style={{
+//               padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer',
+//               background: activeTab === 'video' ? '#1db954' : '#333', color: 'white',
+//               display: 'flex', alignItems: 'center', gap: '5px', fontSize: 'clamp(0.72rem, 2vw, 0.85rem)'
+//             }}>
+//               <Tv size={13} /> <span>Video</span>
+//             </button>
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '32px', height: '32px', flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white' }}>
+//             <X size={16} />
+//           </button>
+//         </div>
+
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+//           {/* VIDEO TAB */}
+//           <div style={{ display: activeTab === 'video' ? 'flex' : 'none', flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+//             {videoLoading && (
+//               <div style={{ color: '#b3b3b3', textAlign: 'center' }}>
+//                 <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎬</div>
+//                 <div>Loading video...</div>
+//               </div>
+//             )}
+//             {videoError && !videoLoading && (
+//               <div style={{ color: '#ff6666', textAlign: 'center', padding: '20px' }}>{videoError}</div>
+//             )}
+//             {!videoLoading && !videoError && (
+//               <div ref={videoWrapperRef} style={{ width: '100%', maxWidth: '900px', aspectRatio: '16/9', borderRadius: '12px', overflow: 'hidden', position: 'relative', background: '#000' }}>
+//                 <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+//                 <div style={{ position: 'absolute', inset: 0, zIndex: 20, background: 'transparent', cursor: 'default' }} onMouseDown={(e) => e.stopPropagation()} />
+//                 <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '60px', background: 'linear-gradient(rgba(0,0,0,0.85), transparent)', zIndex: 30, pointerEvents: 'none' }} />
+//                 <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '50px 16px 12px', background: 'linear-gradient(transparent, rgba(0,0,0,0.9))', zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+//                   <div onClick={handleSeek} style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.3)', borderRadius: '2px', cursor: 'pointer' }}>
+//                     <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                   </div>
+//                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                       <SkipBack size={18} fill={hasPrev ? 'white' : '#555'} style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }} onClick={() => hasPrev && playPrev()} />
+//                       <button onClick={togglePlay} style={{ background: 'white', border: 'none', borderRadius: '50%', width: '36px', height: '36px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+//                         {isPlaying ? <Pause size={18} color="black" /> : <Play size={18} color="black" fill="black" />}
+//                       </button>
+//                       <SkipForward size={18} fill={hasNext ? 'white' : '#555'} style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }} onClick={() => hasNext && playNext()} />
+//                       <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                         {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                       </div>
+//                       <input type="range" min="0" max="100" value={isMuted ? 0 : volume} onChange={handleVolumeChange} style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                     </div>
+//                     <button onClick={handleFullscreen} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'white', display: 'flex', alignItems: 'center' }}>
+//                       {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                     </button>
+//                   </div>
+//                 </div>
+//               </div>
+//             )}
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '20px', overflow: 'hidden' }}>
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px', width: '100%', maxWidth: '600px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title} style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+//                 <div style={{ flex: 1, minWidth: 0 }}>
+//                   <div style={{ fontWeight: 'bold', fontSize: 'clamp(0.85rem, 2.5vw, 1rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.82rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
+//                 </div>
+//                 {(syncedLines.some(l => hasDevanagari(l.text)) || hasDevanagari(plainLyrics)) && (
+//                   <button
+//                     onClick={async () => {
+//                       if (translitMode === 'original') {
+//                         setTranslitMode('loading');
+//                         const lyricsText = syncedLines.length > 0 ? syncedLines.map(l => l.text).join('\n') : plainLyrics;
+//                         const result = await transliterateToHinglish(lyricsText);
+//                         const lines = result.split('\n');
+//                         if (syncedLines.length > 0) {
+//                           setSyncedLines(prev => prev.map((l, i) => ({ ...l, text: lines[i] || l.text })));
+//                         } else { setPlainLyrics(result); }
+//                         setTranslitMode('hinglish');
+//                       } else if (translitMode === 'hinglish') {
+//                         fetchLyrics(currentSong); setTranslitMode('original');
+//                       }
+//                     }}
+//                     disabled={translitMode === 'loading'}
+//                     style={{ flexShrink: 0, padding: '6px 12px', borderRadius: '20px', border: 'none', cursor: translitMode === 'loading' ? 'wait' : 'pointer', background: translitMode === 'hinglish' ? '#1db954' : '#333', color: 'white', fontSize: '0.75rem', fontWeight: 600, whiteSpace: 'nowrap' }}
+//                   >
+//                     {translitMode === 'loading' ? '...' : translitMode === 'hinglish' ? 'अ Original' : 'A Hinglish'}
+//                   </button>
+//                 )}
+//               </div>
+//               {syncedLines.length > 0 && (
+//                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px', background: '#1e1e1e', borderRadius: '20px', padding: '6px 14px' }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button onClick={() => setLyricsOffset(prev => { const v = Math.round((prev - 0.5) * 10) / 10; lyricsOffsetRef.current = v; return v; })} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '26px', height: '26px', cursor: 'pointer', color: 'white', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>−</button>
+//                   <span style={{ color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954', fontSize: '0.82rem', minWidth: '48px', textAlign: 'center' }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button onClick={() => setLyricsOffset(prev => { const v = Math.round((prev + 0.5) * 10) / 10; lyricsOffsetRef.current = v; return v; })} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '26px', height: '26px', cursor: 'pointer', color: 'white', fontSize: '16px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
+//                   {lyricsOffset !== 1.5 && (
+//                     <button onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }} style={{ background: 'transparent', border: 'none', color: '#666', cursor: 'pointer', fontSize: '0.75rem' }}>Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Footer controls */}
+//         <div style={{ padding: '12px 24px 20px', borderTop: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
+//           <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//             <Shuffle size={18} onClick={toggleShuffle} style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//             <SkipBack size={22} fill={hasPrev ? 'white' : '#555'} style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }} onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{ background: 'white', border: 'none', borderRadius: '50%', width: '48px', height: '48px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+//               {isPlaying ? <Pause size={26} color="black" /> : <Play size={26} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={22} fill={hasNext ? 'white' : '#555'} style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }} onClick={() => hasNext && playNext()} />
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//               {repeat === 'one' ? <Repeat1 size={18} style={{ color: '#1db954' }} /> : <Repeat size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//               {repeat !== 'none' && <div style={{ position: 'absolute', bottom: '-4px', left: '50%', transform: 'translateX(-50%)', width: '4px', height: '4px', borderRadius: '50%', background: '#1db954' }} />}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{ width: '60%', height: '4px', background: '#444', borderRadius: '2px', cursor: 'pointer' }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+//       </div>
+
+//       {/* ── PLAYER BAR ── */}
+//       <div className="player-bar">
+//         <div className="player-info" style={{ cursor: 'pointer' }} onClick={() => { setShowModal(true); setActiveTab('lyrics'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//             <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px', opacity: 0, transition: 'opacity 0.2s' }}
+//               onMouseEnter={e => e.currentTarget.style.opacity = 1} onMouseLeave={e => e.currentTarget.style.opacity = 0}>
+//               <Music size={20} color="white" />
+//             </div>
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>{currentIndex + 1} / {queue.length} in playlist</div>
+//             )}
+//           </div>
+//         </div>
+
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <Shuffle size={15} onClick={toggleShuffle} style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3', flexShrink: 0 }} />
+//             <SkipBack size={16} fill={hasPrev ? 'white' : '#555'} style={{ cursor: hasPrev ? 'pointer' : 'not-allowed', flexShrink: 0 }} onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{ background: 'white', border: 'none', borderRadius: '50%', width: '34px', height: '34px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+//               {isPlaying ? <Pause size={18} color="black" /> : <Play size={18} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={16} fill={hasNext ? 'white' : '#555'} style={{ cursor: hasNext ? 'pointer' : 'not-allowed', flexShrink: 0 }} onClick={() => hasNext && playNext()} />
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+//               {repeat === 'one' ? <Repeat1 size={15} style={{ color: '#1db954' }} /> : <Repeat size={15} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//               {repeat !== 'none' && <div style={{ position: 'absolute', bottom: '-4px', left: '50%', transform: 'translateX(-50%)', width: '4px', height: '4px', borderRadius: '50%', background: '#1db954' }} />}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{ width: '100%', height: '4px', background: '#444', borderRadius: '2px', cursor: 'pointer', position: 'relative' }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume} onChange={handleVolumeChange} style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
 
 
 
