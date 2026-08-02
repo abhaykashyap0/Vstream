@@ -83,7 +83,13 @@ const PlayerBar = () => {
 
     // ── Step 1: Check MongoDB cache first ────────────────────────────
     // Backend checks resolved_audio_url + expiry in Song document
-    axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`)
+   axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`, {
+  headers: {
+    'ngrok-skip-browser-warning': 'true',
+    'Accept': 'application/json'
+  },
+  timeout: 15000
+})
       .then(({ data }) => {
         if (data.ok && data.url) {
           console.log(`[Stream] ✅ Audio resolved for: "${currentSong.title}" (${data.source})`);
@@ -434,10 +440,7 @@ const PlayerBar = () => {
       setVideoLoading(true);
       setVideoError('');
       try {
-         const { data } = await axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`, {
-  headers: { 'ngrok-skip-browser-warning': 'true' },
-  timeout: 15000
-});
+        const { data } = await axios.get(`${API}/api/search/youtube-id/${currentSong._id}`);
         // Cache on the song object for this session
         currentSong._videoYoutubeId = data.youtube_id;
         initYouTubePlayer(data.youtube_id, {
