@@ -434,7 +434,10 @@ const PlayerBar = () => {
       setVideoLoading(true);
       setVideoError('');
       try {
-         const { data } = await axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`);
+         const { data } = await axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`, {
+  headers: { 'ngrok-skip-browser-warning': 'true' },
+  timeout: 15000
+});
         // Cache on the song object for this session
         currentSong._videoYoutubeId = data.youtube_id;
         initYouTubePlayer(data.youtube_id, {
