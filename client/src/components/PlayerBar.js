@@ -83,7 +83,7 @@ const PlayerBar = () => {
 
     // ── Step 1: Check MongoDB cache first ────────────────────────────
     // Backend checks resolved_audio_url + expiry in Song document
-    axios.get(`${API}/api/stream/audio-url/${currentSong.youtube_id}`)
+    axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`)
       .then(({ data }) => {
         if (data.ok && data.url) {
           console.log(`[Stream] ✅ Audio resolved for: "${currentSong.title}" (${data.source})`);
