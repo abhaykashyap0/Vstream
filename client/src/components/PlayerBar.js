@@ -76,36 +76,52 @@ const PlayerBar = () => {
   // ════════════════════════════════════════════════════════════════════
   useEffect(() => {
     setResolvedAudioUrl(null);
+    setStreamServerOnline(true); // reset on every song — don't block future songs
     if (!isYouTube || !currentSong?.youtube_id) return;
-    if (!streamServerOnline) return; // skip if server was offline
 
     setIsResolvingAudio(true);
 
-    // ── Step 1: Check MongoDB cache first ────────────────────────────
-    // Backend checks resolved_audio_url + expiry in Song document
-   axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`, {
-  headers: {
-    'ngrok-skip-browser-warning': 'true',
-    'Accept': 'application/json'
-  },
-  timeout: 15000
-})
+    // Call stream server — memory cache returns in <10ms if already resolved
+    axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`, {
+      headers: { 'ngrok-skip-browser-warning': 'true', 'Accept': 'application/json' },
+      params:  { title: currentSong.title || '' },
+      timeout: 15000
+    })
       .then(({ data }) => {
         if (data.ok && data.url) {
-          console.log(`[Stream] ✅ Audio resolved for: "${currentSong.title}" (${data.source})`);
+          console.log(`[Stream] ✅ "${currentSong.title}" (${data.source}, ${data.ms}ms)`);
           setResolvedAudioUrl(data.url);
           setStreamServerOnline(true);
         }
       })
-      .catch((err) => {
-        // Stream server is offline (laptop off / ngrok down)
-        // Fall back to YouTube IFrame silently
+      .catch(() => {
         console.log('[Stream] Server offline, using YouTube IFrame fallback');
         setStreamServerOnline(false);
       })
       .finally(() => setIsResolvingAudio(false));
 
   }, [songKey, isYouTube, currentSong?.youtube_id]); // eslint-disable-line
+
+  // ── Prefetch NEXT song while current plays ────────────────────────
+  // Eliminates perceived 1-2s delay when skipping to next song
+  useEffect(() => {
+    if (!hasNext || !streamServerOnline) return;
+    const nextSong = queue[currentIndex + 1];
+    if (!nextSong?.youtube_id || nextSong.source !== 'youtube') return;
+
+    // Wait 3s so current song resolves first
+    const timer = setTimeout(() => {
+      axios.get(`${STREAM_SERVER}/prefetch/${nextSong.youtube_id}`, {
+        headers: { 'ngrok-skip-browser-warning': 'true' },
+        params:  { title: nextSong.title || '' },
+        timeout: 5000
+      }).then(({ data }) => {
+        console.log(`[Prefetch] ${data.status}: "${nextSong.title}"`);
+      }).catch(() => {});
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [currentIndex, queue, streamServerOnline, hasNext]); // eslint-disable-line
 
   // Reset video state on song change
   useEffect(() => {
