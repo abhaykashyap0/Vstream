@@ -1,12 +1,14 @@
 import React, { useContext, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { AuthContext } from '../context/AuthContext';
-import { Music, LogOut, User as UserIcon, Library, Menu, X } from 'lucide-react';
+import { Music, LogOut, User as UserIcon, Library, Menu, X, Download } from 'lucide-react';
+import ImportPlaylistModal from './ImportPlaylistModal';
 
 const Navbar = () => {
   const { user, logout } = useContext(AuthContext);
   const navigate = useNavigate();
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuOpen,   setMenuOpen]   = useState(false);
+  const [showImport, setShowImport] = useState(false);
 
   const handleLogout = () => {
     logout();
@@ -17,13 +19,13 @@ const Navbar = () => {
   return (
     <>
       <nav className="nav">
-        {/* Logo — same as original */}
+        {/* Logo */}
         <Link to="/" style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '1.5rem', marginLeft: 0, color: 'white', textDecoration: 'none', fontWeight: 700 }}>
           <Music color="#1db954" size={32} />
           <span>VStream</span>
         </Link>
 
-        {/* Desktop links — exactly like original */}
+        {/* Desktop links */}
         <div className="nav-links">
           <Link to="/">Search</Link>
           {user ? (
@@ -32,6 +34,33 @@ const Navbar = () => {
                 <Library size={18} style={{ verticalAlign: 'middle', marginRight: '4px' }} />
                 Library
               </Link>
+
+              {/* ── Import Playlist button ─────────────────────── */}
+              <button
+                onClick={() => setShowImport(true)}
+                title="Import playlist from Spotify, YouTube or JioSaavn"
+                style={{
+                  display:      'flex',
+                  alignItems:   'center',
+                  gap:          '5px',
+                  background:   'transparent',
+                  border:       '1.5px solid #1db954',
+                  borderRadius: '20px',
+                  color:        '#1db954',
+                  cursor:       'pointer',
+                  padding:      '6px 14px',
+                  fontSize:     '0.85rem',
+                  fontWeight:   600,
+                  marginLeft:   '8px',
+                  transition:   'all 0.2s'
+                }}
+                onMouseEnter={e => { e.currentTarget.style.background = '#1db954'; e.currentTarget.style.color = '#000'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = '#1db954'; }}
+              >
+                <Download size={14} />
+                Import
+              </button>
+
               <Link to="/profile" style={{ marginLeft: '20px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '4px' }}>
                 <UserIcon size={18} style={{ verticalAlign: 'middle' }} /> {user.username}
               </Link>
@@ -50,11 +79,8 @@ const Navbar = () => {
           )}
         </div>
 
-        {/* Hamburger — mobile only */}
-        <button
-          className="nav-hamburger"
-          onClick={() => setMenuOpen(prev => !prev)}
-        >
+        {/* Hamburger — mobile */}
+        <button className="nav-hamburger" onClick={() => setMenuOpen(prev => !prev)}>
           {menuOpen ? <X size={24} /> : <Menu size={24} />}
         </button>
       </nav>
@@ -67,15 +93,32 @@ const Navbar = () => {
             <Link to="/library" onClick={() => setMenuOpen(false)}>
               <Library size={18} /> Library
             </Link>
+
+            {/* ── Mobile Import button ───────────────────────────── */}
+            <button
+              onClick={() => { setShowImport(true); setMenuOpen(false); }}
+              style={{
+                background:  'none',
+                border:      'none',
+                cursor:      'pointer',
+                color:       '#1db954',
+                padding:     '12px 16px',
+                display:     'flex',
+                alignItems:  'center',
+                gap:         '8px',
+                fontWeight:  600,
+                fontSize:    '1rem',
+                width:       '100%',
+                textAlign:   'left'
+              }}
+            >
+              <Download size={18} /> Import Playlist
+            </button>
+
             <Link to="/profile" onClick={() => setMenuOpen(false)} style={{ padding: '12px 16px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600, textDecoration: 'none' }}>
               <UserIcon size={18} /> {user.username}
             </Link>
-            <button onClick={handleLogout} style={{
-              background: 'none', border: 'none', cursor: 'pointer',
-              color: '#b3b3b3', padding: '12px 16px',
-              display: 'flex', alignItems: 'center', gap: '8px',
-              fontWeight: 600, fontSize: '1rem', width: '100%'
-            }}>
+            <button onClick={handleLogout} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#b3b3b3', padding: '12px 16px', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600, fontSize: '1rem', width: '100%' }}>
               <LogOut size={18} /> Logout
             </button>
           </>
@@ -86,11 +129,119 @@ const Navbar = () => {
           </>
         )}
       </div>
+
+      {/* ── Import Modal ─────────────────────────────────────────── */}
+      {showImport && (
+        <ImportPlaylistModal
+          onClose={() => setShowImport(false)}
+          onPlaylistCreated={() => {
+            setShowImport(false);
+            navigate('/library');
+          }}
+        />
+      )}
     </>
   );
 };
 
 export default Navbar;
+
+//import pla
+
+
+// import React, { useContext, useState } from 'react';
+// import { Link, useNavigate } from 'react-router-dom';
+// import { AuthContext } from '../context/AuthContext';
+// import { Music, LogOut, User as UserIcon, Library, Menu, X } from 'lucide-react';
+
+// const Navbar = () => {
+//   const { user, logout } = useContext(AuthContext);
+//   const navigate = useNavigate();
+//   const [menuOpen, setMenuOpen] = useState(false);
+
+//   const handleLogout = () => {
+//     logout();
+//     navigate('/login');
+//     setMenuOpen(false);
+//   };
+
+//   return (
+//     <>
+//       <nav className="nav">
+//         {/* Logo — same as original */}
+//         <Link to="/" style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '1.5rem', marginLeft: 0, color: 'white', textDecoration: 'none', fontWeight: 700 }}>
+//           <Music color="#1db954" size={32} />
+//           <span>VStream</span>
+//         </Link>
+
+//         {/* Desktop links — exactly like original */}
+//         <div className="nav-links">
+//           <Link to="/">Search</Link>
+//           {user ? (
+//             <>
+//               <Link to="/library">
+//                 <Library size={18} style={{ verticalAlign: 'middle', marginRight: '4px' }} />
+//                 Library
+//               </Link>
+//               <Link to="/profile" style={{ marginLeft: '20px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '4px' }}>
+//                 <UserIcon size={18} style={{ verticalAlign: 'middle' }} /> {user.username}
+//               </Link>
+//               <button
+//                 onClick={handleLogout}
+//                 style={{ background: 'none', border: 'none', color: '#b3b3b3', cursor: 'pointer', marginLeft: '20px' }}
+//               >
+//                 <LogOut size={18} />
+//               </button>
+//             </>
+//           ) : (
+//             <>
+//               <Link to="/login">Login</Link>
+//               <Link to="/signup" className="btn-primary" style={{ marginLeft: '8px' }}>Sign Up</Link>
+//             </>
+//           )}
+//         </div>
+
+//         {/* Hamburger — mobile only */}
+//         <button
+//           className="nav-hamburger"
+//           onClick={() => setMenuOpen(prev => !prev)}
+//         >
+//           {menuOpen ? <X size={24} /> : <Menu size={24} />}
+//         </button>
+//       </nav>
+
+//       {/* Mobile menu */}
+//       <div className={`nav-mobile-menu ${menuOpen ? 'open' : ''}`}>
+//         <Link to="/" onClick={() => setMenuOpen(false)}>Search</Link>
+//         {user ? (
+//           <>
+//             <Link to="/library" onClick={() => setMenuOpen(false)}>
+//               <Library size={18} /> Library
+//             </Link>
+//             <Link to="/profile" onClick={() => setMenuOpen(false)} style={{ padding: '12px 16px', color: '#1db954', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600, textDecoration: 'none' }}>
+//               <UserIcon size={18} /> {user.username}
+//             </Link>
+//             <button onClick={handleLogout} style={{
+//               background: 'none', border: 'none', cursor: 'pointer',
+//               color: '#b3b3b3', padding: '12px 16px',
+//               display: 'flex', alignItems: 'center', gap: '8px',
+//               fontWeight: 600, fontSize: '1rem', width: '100%'
+//             }}>
+//               <LogOut size={18} /> Logout
+//             </button>
+//           </>
+//         ) : (
+//           <>
+//             <Link to="/login" onClick={() => setMenuOpen(false)}>Login</Link>
+//             <Link to="/signup" onClick={() => setMenuOpen(false)} style={{ color: '#1db954', fontWeight: 700 }}>Sign Up</Link>
+//           </>
+//         )}
+//       </div>
+//     </>
+//   );
+// };
+
+// export default Navbar;
 
 
 //profile edit and opt focus login signup server index profilerout profilepage.js navbar

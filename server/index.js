@@ -13,6 +13,8 @@ const playlistRoutes = require('./routes/playlistRoutes');
 const profileRoutes  = require('./routes/profileRoutes');
 const adminRoutes    = require('./routes/adminRoutes');
 const streamRoutes   = require('./routes/streamRoutes'); // ← NEW
+const importRoutes   = require('./routes/importRoutes');
+
 
 const startServer = async () => {
   await connectDB();
@@ -79,6 +81,7 @@ const startServer = async () => {
   app.use('/api/profile',   profileRoutes);
   app.use('/api/admin',     adminRoutes);
   app.use('/api/stream',    streamRoutes); // ← NEW
+  app.use('/api/import',    importRoutes);
 
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => {
