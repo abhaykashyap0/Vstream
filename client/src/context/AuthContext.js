@@ -8,34 +8,25 @@ const API = process.env.REACT_APP_API_URL || '';
 
 export const AuthProvider = ({ children }) => {
   const [user, setUser]       = useState(null);
-  const [token, setToken]     = useState(null);   // ✅ new
   const [loading, setLoading] = useState(true);
   const { resetPlayer }       = useContext(MusicContext);
 
   useEffect(() => {
-    const storedUser  = localStorage.getItem('musicUser');
-    const storedToken = localStorage.getItem('vstreamToken'); // ✅ restore token too
+    const storedUser = localStorage.getItem('musicUser');
     if (storedUser) setUser(JSON.parse(storedUser));
-    if (storedToken) setToken(storedToken);
     setLoading(false);
   }, []);
 
   const login = async (userData) => {
-    // Expect your login API response to include a token field, e.g.
-    // { _id, username, email, token: "eyJhbGciOi..." }
-    const { token: authToken, ...userOnly } = userData;
+    setUser(userData);
+    localStorage.setItem('musicUser', JSON.stringify(userData));
 
-    setUser(userOnly);
-    setToken(authToken);
-    localStorage.setItem('musicUser', JSON.stringify(userOnly));
-    if (authToken) localStorage.setItem('vstreamToken', authToken); // ✅
-
-    // Session tracking stays separate — unrelated to auth
+    // ✅ Start admin session tracking
     try {
       const res = await axios.post(`${API}/api/admin/session/start`, {
-        userId:    userOnly._id || userOnly.id,
-        username:  userOnly.username,
-        email:     userOnly.email,
+        userId:    userData._id || userData.id,
+        username:  userData.username,
+        email:     userData.email,
         userAgent: navigator.userAgent,
       });
       localStorage.setItem('vstreamSessionId', res.data.sessionId);
@@ -45,6 +36,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   const logout = async () => {
+    // ✅ End admin session tracking
     try {
       const sessionId = localStorage.getItem('vstreamSessionId');
       if (sessionId) {
@@ -55,83 +47,17 @@ export const AuthProvider = ({ children }) => {
     }
 
     setUser(null);
-    setToken(null);
     localStorage.removeItem('musicUser');
-    localStorage.removeItem('vstreamToken');
     localStorage.removeItem('vstreamSessionId');
     resetPlayer();
   };
 
   return (
-    <AuthContext.Provider value={{ user, token, login, logout, loading }}>
+    <AuthContext.Provider value={{ user, login, logout, loading }}>
       {children}
     </AuthContext.Provider>
   );
 };
-
-
-
-
-// import React, { createContext, useState, useEffect, useContext } from 'react';
-// import axios from 'axios';
-// import { MusicContext } from './MusicContext';
-
-// export const AuthContext = createContext();
-
-// const API = process.env.REACT_APP_API_URL || '';
-
-// export const AuthProvider = ({ children }) => {
-//   const [user, setUser]       = useState(null);
-//   const [loading, setLoading] = useState(true);
-//   const { resetPlayer }       = useContext(MusicContext);
-
-//   useEffect(() => {
-//     const storedUser = localStorage.getItem('musicUser');
-//     if (storedUser) setUser(JSON.parse(storedUser));
-//     setLoading(false);
-//   }, []);
-
-//   const login = async (userData) => {
-//     setUser(userData);
-//     localStorage.setItem('musicUser', JSON.stringify(userData));
-
-//     // ✅ Start admin session tracking
-//     try {
-//       const res = await axios.post(`${API}/api/admin/session/start`, {
-//         userId:    userData._id || userData.id,
-//         username:  userData.username,
-//         email:     userData.email,
-//         userAgent: navigator.userAgent,
-//       });
-//       localStorage.setItem('vstreamSessionId', res.data.sessionId);
-//     } catch (err) {
-//       console.warn('Session tracking start failed:', err.message);
-//     }
-//   };
-
-//   const logout = async () => {
-//     // ✅ End admin session tracking
-//     try {
-//       const sessionId = localStorage.getItem('vstreamSessionId');
-//       if (sessionId) {
-//         await axios.post(`${API}/api/admin/session/end`, { sessionId });
-//       }
-//     } catch (err) {
-//       console.warn('Session tracking end failed:', err.message);
-//     }
-
-//     setUser(null);
-//     localStorage.removeItem('musicUser');
-//     localStorage.removeItem('vstreamSessionId');
-//     resetPlayer();
-//   };
-
-//   return (
-//     <AuthContext.Provider value={{ user, login, logout, loading }}>
-//       {children}
-//     </AuthContext.Provider>
-//   );
-// };
 
 
 //admin
