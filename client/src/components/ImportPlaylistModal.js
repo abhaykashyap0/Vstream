@@ -55,7 +55,8 @@ const SOURCE_CONFIG = {
 };
 
 const ImportPlaylistModal = ({ onClose, onPlaylistCreated }) => {
-  const { token } = useContext(AuthContext);
+ const { user } = useContext(AuthContext);
+const token = localStorage.getItem('token');
 
   // Steps: 'source' → 'instructions' → 'url' → 'preview' → 'done'
   const [step,         setStep]         = useState('source');
