@@ -5,6 +5,16 @@ const jwt     = require('jsonwebtoken');
 const User    = require('../models/User');
 const Song    = require('../models/Song');
 const Playlist = require('../models/Playlist');
+router.get('/debug-spotify', async (req, res) => {
+  const clientId     = process.env.SPOTIFY_CLIENT_ID;
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+  res.json({
+    hasClientId:     !!clientId,
+    hasClientSecret: !!clientSecret,
+    clientIdStart:   clientId?.slice(0, 6) || 'MISSING',
+    secretStart:     clientSecret?.slice(0, 6) || 'MISSING'
+  });
+});
 
 // ── Auth middleware ───────────────────────────────────────────────────
 const requireAuth = async (req, res, next) => {
