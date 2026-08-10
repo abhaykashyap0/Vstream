@@ -54,17 +54,50 @@ const getSpotifyToken = async () => {
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
   if (!clientId || !clientSecret) throw new Error('Spotify credentials not configured');
 
-  const creds = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-  const res   = await axios.post(
-    'https://accounts.spotify.com/api/token',
-    'grant_type=client_credentials',
-    { headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
-  );
+  console.log('[Spotify] Getting token with clientId:', clientId.slice(0, 8) + '...');
 
-  spotifyToken    = res.data.access_token;
-  spotifyTokenExp = Date.now() + (res.data.expires_in - 60) * 1000;
-  return spotifyToken;
+  const creds = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+
+  try {
+    const res = await axios.post(
+      'https://accounts.spotify.com/api/token',
+      'grant_type=client_credentials',
+      {
+        headers: {
+          Authorization:  `Basic ${creds}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        }
+      }
+    );
+    spotifyToken    = res.data.access_token;
+    spotifyTokenExp = Date.now() + (res.data.expires_in - 60) * 1000;
+    console.log('[Spotify] ✅ Token obtained');
+    return spotifyToken;
+  } catch (err) {
+    // Log exact Spotify error
+    console.error('[Spotify] Token error status:', err.response?.status);
+    console.error('[Spotify] Token error body:', JSON.stringify(err.response?.data));
+    throw new Error(`Spotify auth failed: ${JSON.stringify(err.response?.data)}`);
+  }
 };
+// const getSpotifyToken = async () => {
+//   if (spotifyToken && Date.now() < spotifyTokenExp) return spotifyToken;
+
+//   const clientId     = process.env.SPOTIFY_CLIENT_ID;
+//   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+//   if (!clientId || !clientSecret) throw new Error('Spotify credentials not configured');
+
+//   const creds = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+//   const res   = await axios.post(
+//     'https://accounts.spotify.com/api/token',
+//     'grant_type=client_credentials',
+//     { headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+//   );
+
+//   spotifyToken    = res.data.access_token;
+//   spotifyTokenExp = Date.now() + (res.data.expires_in - 60) * 1000;
+//   return spotifyToken;
+// };
 
 // ── Extract playlist ID from various URL formats ──────────────────────
 const extractSpotifyId = (url) => {
