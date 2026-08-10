@@ -81,12 +81,16 @@ const getSpotifyToken = async () => {
     throw new Error(`Spotify auth failed: ${JSON.stringify(err.response?.data)}`);
   }
 };
-console.log('[Spotify] Fetching playlist:', playlistId);
-const metaRes = await axios.get(
-  `https://api.spotify.com/v1/playlists/${playlistId}`,
-  { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
-);
-console.log('[Spotify] Playlist name:', metaRes.data.name);
+async function fetchSpotifyPlaylist(playlistId, token) {
+  console.log('[Spotify] Fetching playlist:', playlistId);
+  const metaRes = await axios.get(
+    `https://api.spotify.com/v1/playlists/${playlistId}`,
+    { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
+  );
+  console.log('[Spotify] Playlist name:', metaRes.data.name);
+  return metaRes.data;
+}
+
 // const getSpotifyToken = async () => {
 //   if (spotifyToken && Date.now() < spotifyTokenExp) return spotifyToken;
 
