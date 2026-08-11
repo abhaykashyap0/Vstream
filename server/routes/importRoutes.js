@@ -121,10 +121,23 @@ const extractYouTubePlaylistId = (url) => {
   return match ? match[1] : null;
 };
 
+// const extractJioSaavnId = (url) => {
+//   // https://www.jiosaavn.com/featured/xxx/yyy or /s/playlist/xxx
+//   const match = url.match(/(?:featured|playlist)\/[^/]+\/([a-zA-Z0-9_-]+)/);
+//   return match ? match[1] : null;
+// };
 const extractJioSaavnId = (url) => {
-  // https://www.jiosaavn.com/featured/xxx/yyy or /s/playlist/xxx
-  const match = url.match(/(?:featured|playlist)\/[^/]+\/([a-zA-Z0-9_-]+)/);
-  return match ? match[1] : null;
+  // Format 1: jiosaavn.com/featured/name/ID
+  const match1 = url.match(/(?:featured|playlist)\/[^/]+\/([a-zA-Z0-9_-]+)/);
+  if (match1) return match1[1];
+
+  // Format 2: saavn.com/s/playlist/hash/name/ID
+  const match2 = url.match(/\/playlist\/[^/]+\/[^/]+\/([a-zA-Z0-9_+=/-]+)/);
+  if (match2) return match2[1];
+
+  // Format 3: last segment
+  const parts = url.split('/').filter(Boolean);
+  return parts[parts.length - 1] || null;
 };
 
 // ── Search JioSaavn for a track ───────────────────────────────────────
@@ -343,16 +356,40 @@ router.post('/preview', requireAuth, async (req, res) => {
       playlistName = data.name || 'JioSaavn Playlist';
       const songs  = data.songs || [];
       songs.forEach(item => {
-        const images    = item.image || [];
-        const artists   = item.artists?.primary?.map(a => a.name).join(', ')
-          || item.artists?.all?.map(a => a.name).join(', ') || '';
-        tracks.push({
-          title:    item.name,
-          artist:   artists,
-          image:    images[images.length - 1]?.url || images[0]?.url || '',
-          duration: formatSeconds(item.duration)
-        });
-      });
+  if (!item) return;
+  const images  = item.image || [];
+  // Handle both formats: artists as array or as object
+  let artistStr = '';
+  if (Array.isArray(item.artists)) {
+    artistStr = item.artists.map(a => a.name || a).join(', ');
+  } else if (item.artists?.primary) {
+    artistStr = item.artists.primary.map(a => a.name).join(', ');
+  } else if (item.artists?.all) {
+    artistStr = item.artists.all.map(a => a.name).join(', ');
+  } else if (typeof item.artists === 'string') {
+    artistStr = item.artists;
+  } else {
+    artistStr = item.subtitle || item.artist || 'Unknown Artist';
+  }
+
+  tracks.push({
+    title:    item.name || item.title || 'Unknown',
+    artist:   artistStr,
+    image:    images[images.length - 1]?.url || images[0]?.url || item.image || '',
+    duration: formatSeconds(item.duration)
+  });
+});
+      // songs.forEach(item => {
+      //   const images    = item.image || [];
+      //   const artists   = item.artists?.primary?.map(a => a.name).join(', ')
+      //     || item.artists?.all?.map(a => a.name).join(', ') || '';
+      //   tracks.push({
+      //     title:    item.name,
+      //     artist:   artists,
+      //     image:    images[images.length - 1]?.url || images[0]?.url || '',
+      //     duration: formatSeconds(item.duration)
+      //   });
+      // });
     }
 
     else {
