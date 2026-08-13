@@ -249,6 +249,19 @@ const PlayerBar = () => {
     }
   }, [useNativeAudio, songKey]);
 
+  // Stop the IFrame's audio when native audio takes over (e.g. switching
+  // from a YouTube song playing via IFrame fallback to a JioSaavn song) —
+  // without this, a still-live unmuted IFrame keeps playing in the
+  // background while native <audio> starts the new song simultaneously.
+  useEffect(() => {
+    if (useNativeAudio && playerRef.current && isReady.current) {
+      try {
+        playerRef.current.pauseVideo();
+        playerRef.current.mute();
+      } catch {}
+    }
+  }, [useNativeAudio, songKey]);
+
   // ════════════════════════════════════════════════════════════════════
   // YOUTUBE IFRAME ENGINE
   // Used for:
@@ -909,6 +922,920 @@ const PlayerBar = () => {
 };
 
 export default PlayerBar;
+
+
+
+// import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
+// import { MusicContext } from '../context/MusicContext';
+// import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
+// import axios from 'axios';
+
+// const API           = process.env.REACT_APP_API_URL || '';
+// const STREAM_SERVER = 'https://rancidity-retrain-glacier.ngrok-free.dev';
+
+// const PlayerBar = () => {
+//   const {
+//     currentSong, songKey, isPlaying, togglePlay, setIsPlaying,
+//     playNext, playPrev, queue, shuffle, repeat, toggleShuffle, cycleRepeat
+//   } = useContext(MusicContext);
+
+//   // ── Stable refs to avoid stale closures ──────────────────────────
+//   const playNextRef    = useRef(null);
+//   const playPrevRef    = useRef(null);
+//   const currentSongRef = useRef(null);
+//   const repeatRef      = useRef(repeat);
+//   const togglePlayRef  = useRef(null);
+
+//   useEffect(() => { playNextRef.current    = playNext;    }, [playNext]);
+//   useEffect(() => { playPrevRef.current    = playPrev;    }, [playPrev]);
+//   useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
+//   useEffect(() => { repeatRef.current      = repeat;      }, [repeat]);
+//   useEffect(() => { togglePlayRef.current  = togglePlay;  }, [togglePlay]);
+
+//   // ── Audio engines ─────────────────────────────────────────────────
+//   const audioRef      = useRef(new Audio()); // HTML5 audio — JioSaavn + resolved YouTube
+//   const playerRef     = useRef(null);        // YouTube IFrame — video view only
+//   const playerContRef = useRef(null);
+//   const videoWrapperRef = useRef(null);
+//   const isReady       = useRef(false);
+
+//   // ── State ─────────────────────────────────────────────────────────
+//   const [progress, setProgress]         = useState(0);
+//   const [volume, setVolume]             = useState(100);
+//   const [isMuted, setIsMuted]           = useState(false);
+//   const [showModal, setShowModal]       = useState(false);
+//   const [isFullscreen, setIsFullscreen] = useState(false);
+//   const [activeTab, setActiveTab]       = useState('lyrics');
+
+//   // Lyrics
+//   const [syncedLines, setSyncedLines]           = useState([]);
+//   const [plainLyrics, setPlainLyrics]           = useState('');
+//   const [lyricsLoading, setLyricsLoading]       = useState(false);
+//   const [currentLineIndex, setCurrentLineIndex] = useState(0);
+//   const [lyricsOffset, setLyricsOffset]         = useState(1.5);
+//   const lyricsOffsetRef = useRef(1.5);
+
+//   // Stream server — resolves YouTube video ID → direct audio URL
+//   const [resolvedAudioUrl, setResolvedAudioUrl]   = useState(null);
+//   const [isResolvingAudio, setIsResolvingAudio]   = useState(false);
+//   const [streamServerOnline, setStreamServerOnline] = useState(true);
+
+//   // Video
+//   const [videoLoading, setVideoLoading] = useState(false);
+//   const [videoError, setVideoError]     = useState('');
+
+//   const progressInterval = useRef(null);
+
+//   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//   const hasPrev      = currentIndex > 0;
+//   const hasNext      = currentIndex >= 0 && currentIndex < queue.length - 1;
+
+//   const isJioSaavn   = currentSong?.source === 'jiosaavn';
+//   const isYouTube    = currentSong?.source === 'youtube';
+
+//   // Native audio is used for:
+//   // 1. All JioSaavn songs (direct CDN URL)
+//   // 2. YouTube songs when stream server resolves audio URL
+//   const useNativeAudio = isJioSaavn || (isYouTube && !!resolvedAudioUrl);
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // STREAM SERVER — resolve YouTube video ID → direct audio URL
+//   // Called whenever a YouTube song is loaded
+//   // Checks MongoDB cache first (via backend) to avoid re-resolving
+//   // ════════════════════════════════════════════════════════════════════
+//   useEffect(() => {
+//     setResolvedAudioUrl(null);
+//     setStreamServerOnline(true); // reset on every song — don't block future songs
+//     if (!isYouTube || !currentSong?.youtube_id) return;
+
+//     setIsResolvingAudio(true);
+
+//     // Call stream server — memory cache returns in <10ms if already resolved
+//     axios.get(`${STREAM_SERVER}/audio-url/${currentSong.youtube_id}`, {
+//       headers: { 'ngrok-skip-browser-warning': 'true', 'Accept': 'application/json' },
+//       params:  { title: currentSong.title || '' },
+//       timeout: 15000
+//     })
+//       .then(({ data }) => {
+//         if (data.ok && data.url) {
+//           console.log(`[Stream] ✅ "${currentSong.title}" (${data.source}, ${data.ms}ms)`);
+//           setResolvedAudioUrl(data.url);
+//           setStreamServerOnline(true);
+//         }
+//       })
+//       .catch(() => {
+//         console.log('[Stream] Server offline, using YouTube IFrame fallback');
+//         setStreamServerOnline(false);
+//       })
+//       .finally(() => setIsResolvingAudio(false));
+
+//   }, [songKey, isYouTube, currentSong?.youtube_id]); // eslint-disable-line
+
+//   // ── Prefetch NEXT song while current plays ────────────────────────
+//   // Eliminates perceived 1-2s delay when skipping to next song
+//   useEffect(() => {
+//     if (!hasNext || !streamServerOnline) return;
+//     const nextSong = queue[currentIndex + 1];
+//     if (!nextSong?.youtube_id || nextSong.source !== 'youtube') return;
+
+//     // Wait 3s so current song resolves first
+//     const timer = setTimeout(() => {
+//       axios.get(`${STREAM_SERVER}/prefetch/${nextSong.youtube_id}`, {
+//         headers: { 'ngrok-skip-browser-warning': 'true' },
+//         params:  { title: nextSong.title || '' },
+//         timeout: 5000
+//       }).then(({ data }) => {
+//         console.log(`[Prefetch] ${data.status}: "${nextSong.title}"`);
+//       }).catch(() => {});
+//     }, 3000);
+
+//     return () => clearTimeout(timer);
+//   }, [currentIndex, queue, streamServerOnline, hasNext]); // eslint-disable-line
+
+//   // Reset video state on song change
+//   useEffect(() => {
+//     setVideoError('');
+//     setActiveTab('lyrics');
+//     setProgress(0); // don't show the previous song's leftover seek position
+//   }, [currentSong?._id]);
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // HTML5 AUDIO ENGINE — JioSaavn songs + resolved YouTube songs
+//   // ════════════════════════════════════════════════════════════════════
+//   useEffect(() => {
+//     if (!currentSong || !useNativeAudio) return;
+
+//     const audio = audioRef.current;
+
+//     // Set the correct source
+//     if (isJioSaavn) {
+//       audio.src = currentSong.stream_url;
+//       console.log(`[JioSaavn] Loading: "${currentSong.title}"`);
+//     } else {
+//       // YouTube song resolved to native audio
+//       audio.src = resolvedAudioUrl;
+//       console.log(`[YouTube→Native] Loading: "${currentSong.title}"`);
+//     }
+
+//     audio.volume = isMuted ? 0 : volume / 100;
+//     audio.load();
+//     if (isPlaying) audio.play().catch(() => {});
+
+//     const handleTimeUpdate = () => {
+//       const cur   = audio.currentTime;
+//       const total = audio.duration;
+//       if (total > 0) setProgress((cur / total) * 100);
+//       // Sync lyrics
+//       setSyncedLines(prev => {
+//         if (!prev.length) return prev;
+//         let idx = 0;
+//         for (let i = 0; i < prev.length; i++) {
+//           if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i;
+//           else break;
+//         }
+//         setCurrentLineIndex(idx);
+//         return prev;
+//       });
+//     };
+
+//     const registerMediaSession = () => {
+//       if (!('mediaSession' in navigator)) return;
+//       navigator.mediaSession.metadata = new window.MediaMetadata({
+//         title:   currentSongRef.current?.title   || '',
+//         artist:  currentSongRef.current?.artist  || '',
+//         artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
+//       });
+//       navigator.mediaSession.setActionHandler('play',          () => { audio.play().catch(() => {}); setIsPlaying(true); });
+//       navigator.mediaSession.setActionHandler('pause',         () => { audio.pause(); setIsPlaying(false); });
+//       navigator.mediaSession.setActionHandler('nexttrack',     () => playNextRef.current?.());
+//       navigator.mediaSession.setActionHandler('previoustrack', () => playPrevRef.current?.());
+//       navigator.mediaSession.setActionHandler('stop',          () => { audio.pause(); setIsPlaying(false); });
+//     };
+
+//     const handlePlay  = () => {
+//       setIsPlaying(true);
+//       registerMediaSession();
+//       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+//     };
+//     const handlePause = () => {
+//       setIsPlaying(false);
+//       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+//     };
+//     const handleEnded = () => {
+//       setProgress(0);
+//       if (repeatRef.current === 'one') {
+//         audio.currentTime = 0;
+//         audio.play().catch(() => {});
+//         setIsPlaying(true);
+//       } else {
+//         playNextRef.current?.();
+//       }
+//     };
+//     const handleError = () => {
+//       console.warn('[Audio] Load failed, skipping to next');
+//       playNextRef.current?.();
+//     };
+
+//     audio.addEventListener('timeupdate', handleTimeUpdate);
+//     audio.addEventListener('play',       handlePlay);
+//     audio.addEventListener('pause',      handlePause);
+//     audio.addEventListener('ended',      handleEnded);
+//     audio.addEventListener('error',      handleError);
+//     registerMediaSession();
+
+//     return () => {
+//       audio.removeEventListener('timeupdate', handleTimeUpdate);
+//       audio.removeEventListener('play',       handlePlay);
+//       audio.removeEventListener('pause',      handlePause);
+//       audio.removeEventListener('ended',      handleEnded);
+//       audio.removeEventListener('error',      handleError);
+//     };
+//   }, [songKey, useNativeAudio, resolvedAudioUrl]); // eslint-disable-line
+
+//   // Sync play/pause for native audio
+//   useEffect(() => {
+//     if (!useNativeAudio) return;
+//     if (isPlaying) audioRef.current.play().catch(() => {});
+//     else audioRef.current.pause();
+//   }, [isPlaying, useNativeAudio]);
+
+//   // Sync volume for native audio
+//   useEffect(() => {
+//     if (!useNativeAudio) return;
+//     audioRef.current.volume = isMuted ? 0 : volume / 100;
+//   }, [volume, isMuted, useNativeAudio]);
+
+//   // Stop native audio when IFrame takes over
+//   useEffect(() => {
+//     if (!useNativeAudio) {
+//       try {
+//         audioRef.current.pause();
+//         audioRef.current.currentTime = 0;
+//         audioRef.current.src = '';
+//       } catch {}
+//     }
+//   }, [useNativeAudio, songKey]);
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // YOUTUBE IFRAME ENGINE
+//   // Used for:
+//   // 1. YouTube songs when stream server is offline (audio fallback)
+//   // 2. Video tab — always IFrame regardless of audio source
+//   // ════════════════════════════════════════════════════════════════════
+//   const stopProgressTracking = () => {
+//     if (progressInterval.current) {
+//       clearInterval(progressInterval.current);
+//       progressInterval.current = null;
+//     }
+//   };
+
+//   const startProgressTracking = () => {
+//     stopProgressTracking();
+//     progressInterval.current = setInterval(() => {
+//       if (playerRef.current?.getCurrentTime) {
+//         const cur   = playerRef.current.getCurrentTime();
+//         const total = playerRef.current.getDuration();
+//         if (total > 0) setProgress((cur / total) * 100);
+//         setSyncedLines(prev => {
+//           if (!prev.length) return prev;
+//           let idx = 0;
+//           for (let i = 0; i < prev.length; i++) {
+//             if (prev[i].time <= cur + lyricsOffsetRef.current) idx = i;
+//             else break;
+//           }
+//           setCurrentLineIndex(idx);
+//           return prev;
+//         });
+//       }
+//     }, 300);
+//   };
+
+//   useEffect(() => () => stopProgressTracking(), []);
+
+//   // Load YouTube IFrame API
+//   useEffect(() => {
+//     if (window.YT) return;
+//     const tag  = document.createElement('script');
+//     tag.src    = 'https://www.youtube.com/iframe_api';
+//     document.body.appendChild(tag);
+//   }, []);
+
+//   // ── Global spacebar shortcut for play/pause (desktop keyboard + ────
+//   // Bluetooth/hardware media buttons are handled separately via the
+//   // MediaSession API action handlers registered elsewhere in this file.
+//   useEffect(() => {
+//     const handleKeyDown = (e) => {
+//       if (e.code !== 'Space' && e.key !== ' ') return;
+//       const active     = document.activeElement;
+//       const tag        = active?.tagName;
+//       const isEditable = active?.isContentEditable;
+//       // Don't hijack space while typing in a search box, text field, etc.
+//       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || isEditable) return;
+//       if (!currentSongRef.current) return;
+//       e.preventDefault();
+//       togglePlayRef.current?.();
+//     };
+//     window.addEventListener('keydown', handleKeyDown);
+//     return () => window.removeEventListener('keydown', handleKeyDown);
+//   }, []);
+
+//   // Fullscreen tracking
+//   useEffect(() => {
+//     const onChange = () => {
+//       setIsFullscreen(!!(
+//         document.fullscreenElement || document.webkitFullscreenElement ||
+//         document.mozFullScreenElement || document.msFullscreenElement
+//       ));
+//     };
+//     document.addEventListener('fullscreenchange', onChange);
+//     document.addEventListener('webkitfullscreenchange', onChange);
+//     return () => {
+//       document.removeEventListener('fullscreenchange', onChange);
+//       document.removeEventListener('webkitfullscreenchange', onChange);
+//     };
+//   }, []);
+
+//   const initYouTubePlayer = useCallback((videoId, opts = {}) => {
+//     const { muted = false, onReadyExtra } = opts;
+
+//     const createOrLoad = () => {
+//       if (playerRef.current && isReady.current && typeof playerRef.current.loadVideoById === 'function') {
+//         const activeId = playerRef.current.getVideoData?.()?.video_id;
+//         if (activeId !== videoId) playerRef.current.loadVideoById({ videoId });
+//         // Always re-apply mute state — a reused player might've been left in a
+//         // different mode by whatever last used it (e.g. muted JioSaavn video view).
+//         if (muted) {
+//           playerRef.current.mute();
+//         } else {
+//           playerRef.current.unMute();
+//           playerRef.current.setVolume(volume);
+//         }
+//         onReadyExtra?.({ target: playerRef.current });
+//         return;
+//       }
+
+//       if (playerRef.current) {
+//         try { playerRef.current.destroy(); } catch {}
+//         playerRef.current = null;
+//         isReady.current   = false;
+//       }
+
+//       playerRef.current = new window.YT.Player(playerContRef.current, {
+//         videoId,
+//         playerVars: {
+//           autoplay: 1, controls: 0, disablekb: 1, fs: 0,
+//           iv_load_policy: 3, modestbranding: 1, rel: 0,
+//           playsinline: 1, origin: window.location.origin
+//         },
+//         events: {
+//           onReady: (e) => {
+//             isReady.current = true;
+//             if (muted) {
+//               e.target.mute();
+//             } else {
+//               e.target.unMute();
+//               e.target.setVolume(volume);
+//               startProgressTracking(); // safety net: don't rely solely on catching the PLAYING event
+//             }
+//             e.target.playVideo();
+//             onReadyExtra?.(e);
+//           },
+//           onStateChange: (e) => {
+//             if (e.data === window.YT.PlayerState.PLAYING) {
+//               if (!muted) {
+//                 // IFrame is the audio source (fallback mode)
+//                 setIsPlaying(true);
+//                 startProgressTracking();
+//                 if ('mediaSession' in navigator) {
+//                   navigator.mediaSession.metadata = new window.MediaMetadata({
+//                     title:   currentSongRef.current?.title   || '',
+//                     artist:  currentSongRef.current?.artist  || '',
+//                     artwork: [{ src: currentSongRef.current?.image_url || '', sizes: '512x512', type: 'image/jpeg' }]
+//                   });
+//                   navigator.mediaSession.playbackState = 'playing';
+//                   navigator.mediaSession.setActionHandler('play',          () => { playerRef.current?.playVideo(); setIsPlaying(true); });
+//                   navigator.mediaSession.setActionHandler('pause',         () => { playerRef.current?.pauseVideo(); setIsPlaying(false); });
+//                   navigator.mediaSession.setActionHandler('nexttrack',     () => playNextRef.current?.());
+//                   navigator.mediaSession.setActionHandler('previoustrack', () => playPrevRef.current?.());
+//                 }
+//               }
+//             } else if (e.data === window.YT.PlayerState.PAUSED) {
+//               if (!muted) {
+//                 setIsPlaying(false);
+//                 stopProgressTracking();
+//                 if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+//               }
+//             } else if (e.data === window.YT.PlayerState.ENDED) {
+//               stopProgressTracking();
+//               setProgress(0);
+//               try { playerRef.current?.destroy(); playerRef.current = null; isReady.current = false; } catch {}
+//               if (!muted) {
+//                 // IFrame was audio source — advance playlist
+//                 repeatRef.current === 'one'
+//                   ? playNextRef.current?.()
+//                   : playNextRef.current?.();
+//               }
+//             }
+//           },
+//           onError: (e) => {
+//             console.warn('[YouTube IFrame] Error code:', e.data);
+//             if (!muted && (e.data === 101 || e.data === 150)) {
+//               playNextRef.current?.();
+//             } else {
+//               setVideoError('Video unavailable for this song.');
+//             }
+//           }
+//         }
+//       });
+//     };
+
+//     if (window.YT?.Player) createOrLoad();
+//     else window.onYouTubeIframeAPIReady = createOrLoad;
+//   }, [volume]); // eslint-disable-line
+
+//   // ── YouTube IFrame as AUDIO FALLBACK ─────────────────────────────
+//   // Only when: YouTube song + stream server offline + not resolving
+//   useEffect(() => {
+//     if (!currentSong || !isYouTube) return;
+//     if (resolvedAudioUrl) return;    // native audio available — no IFrame needed
+//     if (isResolvingAudio) return;    // still trying — wait
+//     if (streamServerOnline) return;  // server online but failed? wait for resolve
+
+//     // Stream server confirmed offline — use IFrame as fallback
+//     console.log('[IFrame] Stream server offline, using IFrame for:', currentSong.title);
+//     initYouTubePlayer(currentSong.youtube_id, { muted: false });
+//   }, [songKey, isYouTube, resolvedAudioUrl, isResolvingAudio, streamServerOnline]); // eslint-disable-line
+
+//   // Play/pause sync for IFrame fallback
+//   useEffect(() => {
+//     if (useNativeAudio) return;           // native audio handles it
+//     if (!isYouTube) return;               // not a YouTube song
+//     if (!playerRef.current || !isReady.current) return;
+
+//     if (isPlaying) {
+//       playerRef.current.unMute();
+//       playerRef.current.setVolume(volume);
+//       if (playerRef.current.getPlayerState?.() !== 1) playerRef.current.playVideo();
+//     } else {
+//       playerRef.current.pauseVideo();
+//     }
+//   }, [isPlaying, useNativeAudio, isYouTube]); // eslint-disable-line
+
+//   // Play/pause sync for the muted video-overlay IFrame (native audio drives sound,
+//   // IFrame is visual only here — but it still needs to pause/resume with the song)
+//   useEffect(() => {
+//     if (!useNativeAudio) return;          // handled by the fallback effect above
+//     if (!playerRef.current || !isReady.current) return;
+//     try {
+//       if (isPlaying) {
+//         if (playerRef.current.getPlayerState?.() !== 1) playerRef.current.playVideo();
+//       } else {
+//         playerRef.current.pauseVideo();
+//       }
+//     } catch {}
+//   }, [isPlaying, useNativeAudio]); // eslint-disable-line
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // VIDEO TAB — always YouTube IFrame, regardless of audio source
+//   // For JioSaavn songs: IFrame is muted (audio comes from <audio> tag)
+//   // For YouTube songs: IFrame provides video (may or may not be muted)
+//   // ════════════════════════════════════════════════════════════════════
+//   const handleOpenVideo = async () => {
+//     setActiveTab('video');
+
+//     if (isYouTube && currentSong.youtube_id) {
+//       const activeId = (playerRef.current && isReady.current && typeof playerRef.current.getVideoData === 'function')
+//         ? playerRef.current.getVideoData()?.video_id
+//         : null;
+
+//       if (!useNativeAudio && activeId === currentSong.youtube_id) {
+//         // IFrame is ALREADY the audio engine AND already showing this exact
+//         // song's video — just show the tab, no need to touch the player.
+//         return;
+//       }
+
+//       // Either native audio needs a muted overlay, or the IFrame doesn't have
+//       // the right video loaded yet (e.g. the automatic fallback-audio effect
+//       // hasn't caught up with this song switch yet) — (re)load it correctly.
+//       initYouTubePlayer(currentSong.youtube_id, {
+//         muted: useNativeAudio,
+//         onReadyExtra: useNativeAudio
+//           ? (e) => { try { e.target.seekTo(audioRef.current.currentTime, true); } catch {} }
+//           : undefined
+//       });
+//       return;
+//     }
+
+//     if (isJioSaavn) {
+//       // JioSaavn song — fetch YouTube video ID, then load muted IFrame
+//       if (currentSong._videoYoutubeId) {
+//         // Already resolved in this session
+//         initYouTubePlayer(currentSong._videoYoutubeId, {
+//           muted: true,
+//           onReadyExtra: (e) => { try { e.target.seekTo(audioRef.current.currentTime, true); } catch {} }
+//         });
+//         return;
+//       }
+
+//       setVideoLoading(true);
+//       setVideoError('');
+//       try {
+//         const { data } = await axios.get(`${API}/api/search/youtube-id/${currentSong._id}`);
+//         // Cache on the song object for this session
+//         currentSong._videoYoutubeId = data.youtube_id;
+//         initYouTubePlayer(data.youtube_id, {
+//           muted: true,
+//           onReadyExtra: (e) => { try { e.target.seekTo(audioRef.current.currentTime, true); } catch {} }
+//         });
+//       } catch (err) {
+//         setVideoError(err.response?.data?.message || 'Could not load video for this song.');
+//       } finally {
+//         setVideoLoading(false);
+//       }
+//     }
+//   };
+
+//   const handleCloseVideoView = () => {
+//     setActiveTab('lyrics');
+//     // If IFrame was muted video overlay — just pause it, native audio continues
+//     if (isJioSaavn && playerRef.current) {
+//       try { playerRef.current.pauseVideo(); } catch {}
+//     }
+//   };
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // LYRICS
+//   // ════════════════════════════════════════════════════════════════════
+//   const parseSyncedLyrics = (lrc) => {
+//     if (!lrc) return [];
+//     return lrc.split('\n').map(line => {
+//       const match = line.match(/\[(\d+):(\d+\.\d+)\](.*)/);
+//       if (!match) return null;
+//       const time = parseInt(match[1]) * 60 + parseFloat(match[2]);
+//       return { time, text: match[3].trim() };
+//     }).filter(Boolean);
+//   };
+
+//   const fetchLyrics = useCallback(async (song) => {
+//     if (!song) return;
+//     setLyricsLoading(true);
+//     setSyncedLines([]);
+//     setPlainLyrics('');
+//     setCurrentLineIndex(0);
+//     setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5;
+
+//     try {
+//       const cleanTitle  = song.title.replace(/\(.*?\)/g,'').replace(/\[.*?\]/g,'').replace(/\|.*/g,'').replace(/ft\.?.*/gi,'').replace(/feat\.?.*/gi,'').trim();
+//       const cleanArtist = song.artist.replace(/\s*-\s*Topic$/i,'').replace(/VEVO$/i,'').replace(/official$/i,'').replace(/music$/i,'').trim();
+//       const aggressiveTitle = cleanTitle.replace(/\s*-\s*.*/g,'').replace(/official.*/gi,'').replace(/lyrics.*/gi,'').replace(/video.*/gi,'').replace(/hd.*/gi,'').trim();
+
+//       const scoredMatch = (results, targetTitle, targetArtist) => {
+//         if (!results?.length) return null;
+//         const t = targetTitle.toLowerCase();
+//         const a = targetArtist.toLowerCase();
+//         const scored = results.map(r => {
+//           let score = 0;
+//           const rt = (r.trackName  || '').toLowerCase();
+//           const ra = (r.artistName || '').toLowerCase();
+//           if (rt === t) score += 100;
+//           else if (rt.includes(t) || t.includes(rt)) score += 50;
+//           if (ra === a) score += 40;
+//           else if (ra.includes(a) || a.includes(ra)) score += 20;
+//           if (r.syncedLyrics) score += 10;
+//           return { result: r, score };
+//         });
+//         scored.sort((a, b) => b.score - a.score);
+//         return scored[0].score > 0 ? scored[0].result : results[0];
+//       };
+
+//       const processResult = (match) => {
+//         if (!match) return false;
+//         if (match.syncedLyrics) {
+//           const lines = parseSyncedLyrics(match.syncedLyrics);
+//           if (lines.length > 0) { setSyncedLines(lines); return true; }
+//         }
+//         if (match.plainLyrics) { setPlainLyrics(match.plainLyrics); return true; }
+//         return false;
+//       };
+
+//       let res;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: `${aggressiveTitle} ${cleanArtist}` } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: aggressiveTitle } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, aggressiveTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: `${cleanTitle} ${cleanArtist}` } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: cleanTitle } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, cleanTitle, cleanArtist))) return;
+//       res = await axios.get('https://lrclib.net/api/get', { params: { track_name: aggressiveTitle, artist_name: cleanArtist } });
+//       if (res.data && processResult(res.data)) return;
+//       res = await axios.get('https://lrclib.net/api/search', { params: { q: song.title } });
+//       if (res.data?.length > 0 && processResult(scoredMatch(res.data, song.title, cleanArtist))) return;
+//       setPlainLyrics('Lyrics not found for this song.');
+//     } catch {
+//       setPlainLyrics('Could not load lyrics. Please try again.');
+//     } finally {
+//       setLyricsLoading(false);
+//     }
+//   }, []);
+
+//   useEffect(() => { if (currentSong) fetchLyrics(currentSong); }, [currentSong, fetchLyrics]);
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // CONTROLS
+//   // ════════════════════════════════════════════════════════════════════
+//   const handleSeek = (e) => {
+//     const pct = e.nativeEvent.offsetX / e.currentTarget.offsetWidth;
+//     if (useNativeAudio) {
+//       const total = audioRef.current.duration;
+//       if (total > 0) audioRef.current.currentTime = pct * total;
+//     } else {
+//       if (!playerRef.current || !isReady.current) return;
+//       const total = playerRef.current.getDuration();
+//       if (total > 0) playerRef.current.seekTo(pct * total, true);
+//     }
+//   };
+
+//   const handleVolumeChange = (e) => {
+//     const val = parseInt(e.target.value);
+//     setVolume(val);
+//     if (useNativeAudio) {
+//       audioRef.current.volume = val / 100;
+//       setIsMuted(val === 0);
+//     } else if (playerRef.current && isReady.current) {
+//       playerRef.current.setVolume(val);
+//       if (val === 0) { playerRef.current.mute(); setIsMuted(true); }
+//       else           { playerRef.current.unMute(); setIsMuted(false); }
+//     }
+//   };
+
+//   const toggleMute = () => {
+//     if (useNativeAudio) {
+//       setIsMuted(prev => {
+//         audioRef.current.volume = !prev ? 0 : (volume || 100) / 100;
+//         return !prev;
+//       });
+//     } else {
+//       if (!playerRef.current || !isReady.current) return;
+//       if (isMuted) { playerRef.current.unMute(); playerRef.current.setVolume(volume || 100); setIsMuted(false); }
+//       else         { playerRef.current.mute(); setIsMuted(true); }
+//     }
+//   };
+
+//   const handleFullscreen = () => {
+//     const el = videoWrapperRef.current;
+//     if (!el) return;
+//     const isFull = !!(document.fullscreenElement || document.webkitFullscreenElement);
+//     if (isFull) { (document.exitFullscreen || document.webkitExitFullscreen)?.call(document); }
+//     else        { (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el); }
+//   };
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // LYRICS RENDERER
+//   // ════════════════════════════════════════════════════════════════════
+//   const renderLyrics = () => {
+//     if (lyricsLoading) return (
+//       <div style={{ textAlign: 'center', paddingTop: '60px', color: '#b3b3b3' }}>
+//         <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎵</div>
+//         <div>Loading lyrics...</div>
+//       </div>
+//     );
+
+//     if (syncedLines.length > 0) {
+//       const startIdx = Math.max(0, currentLineIndex - 1);
+//       const visible  = syncedLines.slice(startIdx, startIdx + 4);
+//       return (
+//         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: '18px', padding: '20px' }}>
+//           {visible.map((line, i) => {
+//             const gi = startIdx + i;
+//             const isCur  = gi === currentLineIndex;
+//             const isNext = gi === currentLineIndex + 1;
+//             const isPast = gi <  currentLineIndex;
+//             return (
+//               <div key={gi} style={{
+//                 textAlign: 'center', lineHeight: '1.5',
+//                 fontSize:   isCur ? '1.5rem' : '1.1rem',
+//                 fontWeight: isCur ? 'bold' : 'normal',
+//                 color:  isCur ? '#1db954' : isNext ? '#ffffff' : isPast ? '#555' : '#888',
+//                 opacity:    isCur ? 1 : isNext ? 0.85 : 0.4,
+//                 transform:  isCur ? 'scale(1.05)' : 'scale(1)',
+//                 transition: 'all 0.3s ease'
+//               }}>
+//                 {line.text || ' '}
+//               </div>
+//             );
+//           })}
+//           <div style={{ marginTop: '20px', color: '#555', fontSize: '0.75rem' }}>
+//             {currentLineIndex + 1} / {syncedLines.length}
+//           </div>
+//         </div>
+//       );
+//     }
+
+//     return (
+//       <div style={{ padding: '10px 20px', textAlign: 'center' }}>
+//         {plainLyrics.split('\n').map((line, i) => (
+//           <p key={i} style={{ margin: 0, color: line.trim() ? '#ddd' : 'transparent', fontSize: 'clamp(0.88rem, 2.5vw, 1rem)', lineHeight: '2', minHeight: '2rem' }}>
+//             {line.trim() || '\u00a0'}
+//           </p>
+//         ))}
+//       </div>
+//     );
+//   };
+
+//   if (!currentSong) return null;
+
+//   // ════════════════════════════════════════════════════════════════════
+//   // RENDER
+//   // ════════════════════════════════════════════════════════════════════
+//   return (
+//     <>
+//       {/* ── MODAL ─────────────────────────────────────────────────── */}
+//       <div style={{
+//         position: 'fixed', inset: 0, zIndex: 2000,
+//         background: 'rgba(0,0,0,0.96)', display: 'flex', flexDirection: 'column',
+//         visibility: showModal ? 'visible' : 'hidden',
+//         pointerEvents: showModal ? 'all' : 'none'
+//       }}>
+//         {/* Modal header */}
+//         <div style={{ display: 'flex', alignItems: 'center', padding: '10px 14px', borderBottom: '1px solid #333', gap: '10px' }}>
+//           <div style={{ flex: 1, minWidth: 0 }}>
+//             <div style={{ fontWeight: 'bold', fontSize: 'clamp(0.82rem, 2.5vw, 1rem)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
+//             <div style={{ color: '#b3b3b3', fontSize: '0.82rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
+//           </div>
+
+//           {/* Source badge */}
+//           <div style={{ fontSize: '0.7rem', padding: '3px 8px', borderRadius: '12px', background: isJioSaavn ? '#1a3a1a' : useNativeAudio ? '#1a2a3a' : '#2a1a1a', color: isJioSaavn ? '#1db954' : useNativeAudio ? '#4a9eff' : '#ff9944', flexShrink: 0 }}>
+//             {isJioSaavn ? '🎵 JioSaavn' : useNativeAudio ? '🎵 Native' : '▶ YouTube'}
+//           </div>
+
+//           <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+//             <button onClick={() => { setActiveTab('lyrics'); handleCloseVideoView(); }}
+//               style={{ padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer', background: activeTab === 'lyrics' ? '#1db954' : '#333', color: 'white', fontSize: '0.82rem', display: 'flex', alignItems: 'center', gap: '5px' }}>
+//               <Music size={13} /> Lyrics
+//             </button>
+//             <button onClick={handleOpenVideo}
+//               style={{ padding: '7px 12px', borderRadius: '20px', border: 'none', cursor: 'pointer', background: activeTab === 'video' ? '#1db954' : '#333', color: 'white', fontSize: '0.82rem', display: 'flex', alignItems: 'center', gap: '5px' }}>
+//               <Tv size={13} /> Video
+//             </button>
+//           </div>
+//           <button onClick={() => setShowModal(false)} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '32px', height: '32px', flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white' }}>
+//             <X size={16} />
+//           </button>
+//         </div>
+
+//         {/* Modal body */}
+//         <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+
+//           {/* VIDEO TAB */}
+//           <div style={{ display: activeTab === 'video' ? 'flex' : 'none', flex: 1, alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
+//             <div ref={videoWrapperRef} style={{ width: '100%', maxWidth: '900px', aspectRatio: '16/9', borderRadius: '12px', overflow: 'hidden', position: 'relative', background: '#000' }}>
+//               {/* Player container stays mounted always — never unmount this while loading/error toggle, or the live YT iframe gets torn out and playerRef becomes stale (causes "not attached to DOM" errors). */}
+//               <div ref={playerContRef} style={{ width: '100%', height: '100%' }} />
+
+//               {videoLoading && (
+//                 <div style={{ position: 'absolute', inset: 0, zIndex: 25, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', color: '#b3b3b3', textAlign: 'center' }}>
+//                   <div>
+//                     <div style={{ fontSize: '2rem', marginBottom: '12px' }}>🎬</div>
+//                     <div>Loading video...</div>
+//                   </div>
+//                 </div>
+//               )}
+//               {videoError && !videoLoading && (
+//                 <div style={{ position: 'absolute', inset: 0, zIndex: 25, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', color: '#ff6666', textAlign: 'center', padding: '20px' }}>
+//                   {videoError}
+//                 </div>
+//               )}
+
+//               {!videoLoading && !videoError && (
+//                 <>
+//                   <div style={{ position: 'absolute', inset: 0, zIndex: 20, background: 'transparent', cursor: 'default' }} onMouseDown={e => e.stopPropagation()} />
+//                   {/* Video controls overlay */}
+//                   <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '50px 16px 12px', background: 'linear-gradient(transparent, rgba(0,0,0,0.9))', zIndex: 30, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+//                     <div onClick={handleSeek} style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.3)', borderRadius: '2px', cursor: 'pointer' }}>
+//                       <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//                     </div>
+//                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+//                       <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+//                         <SkipBack size={18} fill={hasPrev ? 'white' : '#555'} style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }} onClick={() => hasPrev && playPrev()} />
+//                         <button onClick={togglePlay} style={{ background: 'white', border: 'none', borderRadius: '50%', width: '36px', height: '36px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+//                           {isPlaying ? <Pause size={18} color="black" /> : <Play size={18} color="black" fill="black" />}
+//                         </button>
+//                         <SkipForward size={18} fill={hasNext ? 'white' : '#555'} style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }} onClick={() => hasNext && playNext()} />
+//                         <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//                           {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+//                         </div>
+//                         <input type="range" min="0" max="100" value={isMuted ? 0 : volume} onChange={handleVolumeChange} style={{ width: '70px', accentColor: '#1db954', cursor: 'pointer' }} />
+//                       </div>
+//                       <button onClick={handleFullscreen} style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'white', display: 'flex' }}>
+//                         {isFullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+//                       </button>
+//                     </div>
+//                   </div>
+//                 </>
+//               )}
+//             </div>
+//           </div>
+
+//           {/* LYRICS TAB */}
+//           {activeTab === 'lyrics' && (
+//             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '20px', overflow: 'hidden' }}>
+//               <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px', width: '100%', maxWidth: '600px' }}>
+//                 <img src={currentSong.image_url} alt={currentSong.title} style={{ width: '52px', height: '52px', borderRadius: '8px', objectFit: 'cover', flexShrink: 0 }} />
+//                 <div style={{ flex: 1, minWidth: 0 }}>
+//                   <div style={{ fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.title}</div>
+//                   <div style={{ color: '#b3b3b3', fontSize: '0.82rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{currentSong.artist}</div>
+//                 </div>
+//               </div>
+//               {syncedLines.length > 0 && (
+//                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px', background: '#1e1e1e', borderRadius: '20px', padding: '6px 14px' }}>
+//                   <span style={{ color: '#b3b3b3', fontSize: '0.78rem' }}>Sync</span>
+//                   <button onClick={() => { const v = Math.round((lyricsOffset - 0.5) * 10) / 10; setLyricsOffset(v); lyricsOffsetRef.current = v; }} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '26px', height: '26px', cursor: 'pointer', color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>−</button>
+//                   <span style={{ color: lyricsOffset === 1.5 ? '#b3b3b3' : '#1db954', fontSize: '0.82rem', minWidth: '48px', textAlign: 'center' }}>
+//                     {lyricsOffset > 0 ? `+${lyricsOffset}s` : `${lyricsOffset}s`}
+//                   </span>
+//                   <button onClick={() => { const v = Math.round((lyricsOffset + 0.5) * 10) / 10; setLyricsOffset(v); lyricsOffsetRef.current = v; }} style={{ background: '#333', border: 'none', borderRadius: '50%', width: '26px', height: '26px', cursor: 'pointer', color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>+</button>
+//                   {lyricsOffset !== 1.5 && (
+//                     <button onClick={() => { setLyricsOffset(1.5); lyricsOffsetRef.current = 1.5; }} style={{ background: 'transparent', border: 'none', color: '#666', cursor: 'pointer', fontSize: '0.75rem' }}>Reset</button>
+//                   )}
+//                 </div>
+//               )}
+//               <div style={{ width: '100%', maxWidth: '600px', minHeight: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+//                 {renderLyrics()}
+//               </div>
+//             </div>
+//           )}
+//         </div>
+
+//         {/* Modal footer controls */}
+//         <div style={{ padding: '12px 24px 20px', borderTop: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
+//           <div style={{ display: 'flex', alignItems: 'center', gap: '24px' }}>
+//             <Shuffle size={18} onClick={toggleShuffle} style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3' }} />
+//             <SkipBack size={22} fill={hasPrev ? 'white' : '#555'} style={{ cursor: hasPrev ? 'pointer' : 'not-allowed' }} onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{ background: 'white', border: 'none', borderRadius: '50%', width: '48px', height: '48px', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+//               {isPlaying ? <Pause size={26} color="black" /> : <Play size={26} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={22} fill={hasNext ? 'white' : '#555'} style={{ cursor: hasNext ? 'pointer' : 'not-allowed' }} onClick={() => hasNext && playNext()} />
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative' }}>
+//               {repeat === 'one' ? <Repeat1 size={18} style={{ color: '#1db954' }} /> : <Repeat size={18} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//               {repeat !== 'none' && <div style={{ position: 'absolute', bottom: '-4px', left: '50%', transform: 'translateX(-50%)', width: '4px', height: '4px', borderRadius: '50%', background: '#1db954' }} />}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{ width: '60%', height: '4px', background: '#444', borderRadius: '2px', cursor: 'pointer' }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+//       </div>
+
+//       {/* ── PLAYER BAR ────────────────────────────────────────────── */}
+//       <div className="player-bar">
+//         <div className="player-info" style={{ cursor: 'pointer' }} onClick={() => { setShowModal(true); setActiveTab('lyrics'); }}>
+//           <div style={{ position: 'relative' }}>
+//             <img src={currentSong.image_url} alt={currentSong.title} />
+//           </div>
+//           <div>
+//             <div className="song-title">{currentSong.title}</div>
+//             <div className="song-artist">{currentSong.artist}</div>
+//             {/* Show stream status */}
+//             <div style={{ fontSize: '10px', color: isJioSaavn ? '#1db954' : useNativeAudio ? '#4a9eff' : isResolvingAudio ? '#ff9944' : '#ff6644', marginTop: '2px' }}>
+//               {isJioSaavn ? '● JioSaavn' : useNativeAudio ? '● Native Audio' : isResolvingAudio ? '⟳ Resolving...' : '▶ YouTube IFrame'}
+//             </div>
+//             {queue.length > 0 && currentIndex >= 0 && (
+//               <div style={{ fontSize: '11px', color: '#1db954', marginTop: '2px' }}>{currentIndex + 1} / {queue.length} in playlist</div>
+//             )}
+//           </div>
+//         </div>
+
+//         <div className="player-controls">
+//           <div className="control-buttons">
+//             <Shuffle size={15} onClick={toggleShuffle} style={{ cursor: 'pointer', color: shuffle ? '#1db954' : '#b3b3b3', flexShrink: 0 }} />
+//             <SkipBack size={16} fill={hasPrev ? 'white' : '#555'} style={{ cursor: hasPrev ? 'pointer' : 'not-allowed', flexShrink: 0 }} onClick={() => hasPrev && playPrev()} />
+//             <button onClick={togglePlay} style={{ background: 'white', border: 'none', borderRadius: '50%', width: '34px', height: '34px', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+//               {isPlaying ? <Pause size={18} color="black" /> : <Play size={18} color="black" fill="black" />}
+//             </button>
+//             <SkipForward size={16} fill={hasNext ? 'white' : '#555'} style={{ cursor: hasNext ? 'pointer' : 'not-allowed', flexShrink: 0 }} onClick={() => hasNext && playNext()} />
+//             <div onClick={cycleRepeat} style={{ cursor: 'pointer', position: 'relative', flexShrink: 0 }}>
+//               {repeat === 'one' ? <Repeat1 size={15} style={{ color: '#1db954' }} /> : <Repeat size={15} style={{ color: repeat === 'all' ? '#1db954' : '#b3b3b3' }} />}
+//               {repeat !== 'none' && <div style={{ position: 'absolute', bottom: '-4px', left: '50%', transform: 'translateX(-50%)', width: '4px', height: '4px', borderRadius: '50%', background: '#1db954' }} />}
+//             </div>
+//           </div>
+//           <div onClick={handleSeek} style={{ width: '100%', height: '4px', background: '#444', borderRadius: '2px', cursor: 'pointer', position: 'relative' }}>
+//             <div style={{ width: `${progress}%`, height: '100%', background: '#1db954', borderRadius: '2px' }} />
+//           </div>
+//         </div>
+
+//         <div className="player-volume" style={{ width: '30%', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '10px' }}>
+//           <div onClick={toggleMute} style={{ cursor: 'pointer' }}>
+//             {isMuted || volume === 0 ? <VolumeX size={20} /> : <Volume2 size={20} />}
+//           </div>
+//           <input type="range" min="0" max="100" value={isMuted ? 0 : volume} onChange={handleVolumeChange} style={{ width: '80px', accentColor: '#1db954', cursor: 'pointer' }} />
+//         </div>
+//       </div>
+//     </>
+//   );
+// };
+
+// export default PlayerBar;
 
 
 
