@@ -1,5 +1,5 @@
 import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
-import { MusicContext } from '../context/MusicContext';
+import { MusicContext, songIdentity } from '../context/MusicContext';
 import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
 import axios from 'axios';
 
@@ -104,7 +104,8 @@ const PlayerBar = () => {
 
   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
   const hasPrev      = currentIndex > 0;
-  const hasNext      = currentIndex >= 0 && currentIndex < queue.length - 1;
+  // Only counts entries that are a different song (not a duplicate of the same video)
+  const hasNext      = currentIndex >= 0 && queue.slice(currentIndex + 1).some(s => songIdentity(s) !== songIdentity(currentSong));
   hasNextRef.current = hasNext;
 
   const isJioSaavn   = currentSong?.source === 'jiosaavn';
@@ -152,7 +153,7 @@ const PlayerBar = () => {
   // Eliminates perceived 1-2s delay when skipping to next song
   useEffect(() => {
     if (!hasNext || !streamServerOnline) return;
-    const nextSong = queue[currentIndex + 1];
+    const nextSong = queue.slice(currentIndex + 1).find(s => songIdentity(s) !== songIdentity(currentSong));
     if (!nextSong?.youtube_id || nextSong.source !== 'youtube') return;
 
     // Wait 3s so the current song resolves first, then resolve AND download the
