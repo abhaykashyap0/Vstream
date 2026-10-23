@@ -57,6 +57,7 @@ const PlayerBar = () => {
   const currentSongRef = useRef(null);
   const repeatRef      = useRef(repeat);
   const togglePlayRef  = useRef(null);
+  const hasNextRef     = useRef(false);
 
   useEffect(() => { playNextRef.current    = playNext;    }, [playNext]);
   useEffect(() => { playPrevRef.current    = playPrev;    }, [playPrev]);
@@ -104,6 +105,7 @@ const PlayerBar = () => {
   const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
   const hasPrev      = currentIndex > 0;
   const hasNext      = currentIndex >= 0 && currentIndex < queue.length - 1;
+  hasNextRef.current = hasNext;
 
   const isJioSaavn   = currentSong?.source === 'jiosaavn';
   const isYouTube    = currentSong?.source === 'youtube';
@@ -233,6 +235,16 @@ const PlayerBar = () => {
       setIsPlaying(false);
       if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
     };
+    // At the end of the queue (and repeat-all off) stop instead of calling playNext,
+    // which could re-load the same song in a loop.
+    const advanceOrStop = () => {
+      if (hasNextRef.current || repeatRef.current === 'all') {
+        playNextRef.current?.();
+      } else {
+        audio.pause();
+        setIsPlaying(false);
+      }
+    };
     const handleEnded = () => {
       setProgress(0);
       if (repeatRef.current === 'one') {
@@ -240,13 +252,13 @@ const PlayerBar = () => {
         audio.play().catch(() => {});
         setIsPlaying(true);
       } else {
-        playNextRef.current?.();
+        advanceOrStop();
       }
     };
     const handleError = () => {
       const err = audio.error;
       console.warn(`[Audio] Load failed (code ${err?.code}: ${err?.message || 'no message'}) src=${String(audio.src).slice(0, 80)}, skipping to next`);
-      playNextRef.current?.();
+      advanceOrStop();
     };
 
     audio.addEventListener('timeupdate', handleTimeUpdate);
@@ -462,9 +474,8 @@ const PlayerBar = () => {
               try { playerRef.current?.destroy(); playerRef.current = null; isReady.current = false; } catch {}
               if (!muted) {
                 // IFrame was audio source — advance playlist
-                repeatRef.current === 'one'
-                  ? playNextRef.current?.()
-                  : playNextRef.current?.();
+                if (hasNextRef.current || repeatRef.current === 'all') playNextRef.current?.();
+                else setIsPlaying(false);
               }
             }
           },
