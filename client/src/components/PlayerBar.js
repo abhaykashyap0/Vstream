@@ -1,5 +1,5 @@
 import React, { useContext, useEffect, useRef, useState, useCallback } from 'react';
-import { MusicContext, songIdentity } from '../context/MusicContext';
+import { MusicContext, songIdentity, findSongIndex } from '../context/MusicContext';
 import { Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, X, Music, Tv, Maximize2, Minimize2, Shuffle, Repeat, Repeat1 } from 'lucide-react';
 import axios from 'axios';
 
@@ -103,7 +103,7 @@ const PlayerBar = () => {
 
   const progressInterval = useRef(null);
 
-  const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+  const currentIndex = findSongIndex(queue, currentSong);
   const hasPrev      = currentIndex > 0;
   // Only counts entries that are a different song (not a duplicate of the same video)
   const hasNext      = currentIndex >= 0 && queue.slice(currentIndex + 1).some(s => songIdentity(s) !== songIdentity(currentSong));

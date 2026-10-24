@@ -10,6 +10,18 @@ export const MusicContext = createContext();
 // the player never "plays next" into an identical track.
 export const songIdentity = (s) => s?.youtube_id || s?.jiosaavn_id || s?._id;
 
+// Position of `song` in `queue`. Does NOT rely on _id alone: search results can have
+// a missing/duplicate _id, which made every song look like position 0 and bounced
+// playback between the same two songs. Order: same object → same _id → same audio.
+export const findSongIndex = (queue, song) => {
+  if (!song || !queue?.length) return -1;
+  let i = queue.indexOf(song);
+  if (i >= 0) return i;
+  if (song._id) { i = queue.findIndex(s => s._id && s._id === song._id); if (i >= 0) return i; }
+  const id = songIdentity(song);
+  return id ? queue.findIndex(s => songIdentity(s) === id) : -1;
+};
+
 export const MusicProvider = ({ children }) => {
   const getToken = () => {
     try { return JSON.parse(localStorage.getItem('musicUser'))?.token; } catch { return null; }
@@ -78,7 +90,7 @@ export const MusicProvider = ({ children }) => {
       setSongKey(prev => prev + 1);
       return;
     }
-    const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+    const currentIndex = findSongIndex(queue, currentSong);
     const currentId    = songIdentity(currentSong);
     const isDifferent  = (i) => songIdentity(queue[i]) !== currentId;
     let nextIndex = -1;
@@ -98,7 +110,8 @@ export const MusicProvider = ({ children }) => {
         }
       }
     }
-    if (nextIndex < 0) return; // nothing different left to play
+    if (nextIndex < 0) { console.log(`[Queue] end of queue at ${currentIndex + 1}/${queue.length} (shuffle=${shuffle}, repeat=${repeat}) — nothing different left to play`); return; }
+    console.log(`[Queue] ${currentIndex + 1}/${queue.length} "${currentSong?.title}" → ${nextIndex + 1}/${queue.length} "${queue[nextIndex]?.title}" (shuffle=${shuffle}, repeat=${repeat})`);
     setCurrentSong(queue[nextIndex]);
     setIsPlaying(true);
     setSongKey(prev => prev + 1);
@@ -107,7 +120,7 @@ export const MusicProvider = ({ children }) => {
 
   const playPrev = useCallback(() => {
     if (!queue.length) return;
-    const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+    const currentIndex = findSongIndex(queue, currentSong);
     let prevIndex;
     if (shuffle) {
       prevIndex = getRandomIndex(currentIndex, queue.length);
@@ -155,6 +168,165 @@ export const MusicProvider = ({ children }) => {
     </MusicContext.Provider>
   );
 };
+
+
+// import React, { createContext, useState, useCallback } from 'react';
+// import axios from 'axios';
+
+// const API = process.env.REACT_APP_API_URL || '';
+
+// export const MusicContext = createContext();
+
+// // Two queue entries can be different DB documents (different _id) but the same
+// // underlying audio (same YouTube / JioSaavn id). Treat those as the same song so
+// // the player never "plays next" into an identical track.
+// export const songIdentity = (s) => s?.youtube_id || s?.jiosaavn_id || s?._id;
+
+// export const MusicProvider = ({ children }) => {
+//   const getToken = () => {
+//     try { return JSON.parse(localStorage.getItem('musicUser'))?.token; } catch { return null; }
+//   };
+
+//   const [currentSong, setCurrentSong] = useState(null);
+//   const [isPlaying, setIsPlaying]     = useState(false);
+//   const [songKey, setSongKey]         = useState(0);
+//   const [queue, setQueue]             = useState([]);
+//   const [shuffle, setShuffle]         = useState(false);
+//   const [repeat, setRepeat]           = useState('none'); // 'none' | 'one' | 'all'
+
+//   // ── Internal helper: report song play to admin tracker ─────────────────
+//   const reportSongPlay = (song) => {
+//     try {
+//       const sessionId = localStorage.getItem('vstreamSessionId');
+//       if (!sessionId || !song) return;
+//       axios.post(`${API}/api/admin/session/song`, {
+//         sessionId,
+//         songId: song._id || song.id || '',
+//         title:  song.title || song.name || 'Unknown',
+//         artist: song.artist || song.primaryArtists || song.singers || ''
+//       }).catch(() => {}); // silent fail — never block playback
+//     } catch {}
+//   };
+
+//   const playSong = (song, playlistSongs = []) => {
+//     setCurrentSong(song);
+//     setIsPlaying(true);
+//     setSongKey(prev => prev + 1);
+//     if (playlistSongs.length > 0) setQueue(playlistSongs);
+
+//     // Track recently played
+//     const token = getToken();
+//     if (token && song?._id) {
+//       axios.post(`${API}/api/playlists/recently-played`,
+//         { songId: song._id },
+//         { headers: { Authorization: `Bearer ${token}` } }
+//       ).catch(() => {});
+//     }
+
+//     // ✅ Track for admin dashboard
+//     reportSongPlay(song);
+//   };
+
+//   const addToQueue = (song) => {
+//     setQueue(prev => {
+//       if (prev.some(s => s._id === song._id)) return prev;
+//       return [...prev, song];
+//     });
+//   };
+
+//   const getRandomIndex = useCallback((currentIndex, queueLength) => {
+//     if (queueLength <= 1) return 0;
+//     let rand;
+//     do { rand = Math.floor(Math.random() * queueLength); }
+//     while (rand === currentIndex);
+//     return rand;
+//   }, []);
+
+//   const playNext = useCallback(() => {
+//     if (!queue.length) return;
+//     if (repeat === 'one') {
+//       setCurrentSong(prev => prev);
+//       setIsPlaying(true);
+//       setSongKey(prev => prev + 1);
+//       return;
+//     }
+//     const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//     const currentId    = songIdentity(currentSong);
+//     const isDifferent  = (i) => songIdentity(queue[i]) !== currentId;
+//     let nextIndex = -1;
+
+//     if (shuffle) {
+//       for (let tries = 0; tries < 10 && nextIndex < 0; tries++) {
+//         const candidate = getRandomIndex(currentIndex, queue.length);
+//         if (isDifferent(candidate)) nextIndex = candidate;
+//       }
+//     } else {
+//       for (let i = currentIndex + 1; i < queue.length; i++) {
+//         if (isDifferent(i)) { nextIndex = i; break; }
+//       }
+//       if (nextIndex < 0 && repeat === 'all') {
+//         for (let i = 0; i < queue.length; i++) {
+//           if (isDifferent(i)) { nextIndex = i; break; }
+//         }
+//       }
+//     }
+//     if (nextIndex < 0) return; // nothing different left to play
+//     setCurrentSong(queue[nextIndex]);
+//     setIsPlaying(true);
+//     setSongKey(prev => prev + 1);
+//     reportSongPlay(queue[nextIndex]);
+//   }, [queue, currentSong, repeat, shuffle, getRandomIndex]);
+
+//   const playPrev = useCallback(() => {
+//     if (!queue.length) return;
+//     const currentIndex = queue.findIndex(s => s._id === currentSong?._id);
+//     let prevIndex;
+//     if (shuffle) {
+//       prevIndex = getRandomIndex(currentIndex, queue.length);
+//     } else if (currentIndex > 0) {
+//       prevIndex = currentIndex - 1;
+//     } else if (repeat === 'all') {
+//       prevIndex = queue.length - 1;
+//     } else {
+//       return;
+//     }
+//     setCurrentSong(queue[prevIndex]);
+//     setIsPlaying(true);
+//     setSongKey(prev => prev + 1);
+//     reportSongPlay(queue[prevIndex]);
+//   }, [queue, currentSong, repeat, shuffle, getRandomIndex]);
+
+//   const cycleRepeat = () => {
+//     setRepeat(prev =>
+//       prev === 'none' ? 'one' :
+//       prev === 'one'  ? 'all' : 'none'
+//     );
+//   };
+
+//   const toggleShuffle = () => setShuffle(prev => !prev);
+//   const togglePlay    = () => setIsPlaying(prev => !prev);
+
+//   const resetPlayer = () => {
+//     setCurrentSong(null);
+//     setIsPlaying(false);
+//     setSongKey(0);
+//     setQueue([]);
+//     setShuffle(false);
+//     setRepeat('none');
+//   };
+
+//   return (
+//     <MusicContext.Provider value={{
+//       currentSong, songKey, isPlaying,
+//       queue, shuffle, repeat,
+//       playSong, playNext, playPrev, addToQueue,
+//       togglePlay, toggleShuffle, cycleRepeat, setIsPlaying,
+//       resetPlayer
+//     }}>
+//       {children}
+//     </MusicContext.Provider>
+//   );
+// };
 
 
 /// songrepeat
