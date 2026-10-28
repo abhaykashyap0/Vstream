@@ -290,9 +290,25 @@ const PlayerBar = () => {
     }
     if (isPlaying) audio.play().catch(() => {});
 
+    // Keeps the silent video in step with the audio: after a seek, a repeat-one restart,
+    // a resume, or slow drift. Does nothing unless the player is showing this song.
+    let lastVideoSync = 0;
+    const syncVideo = () => {
+      const p = playerRef.current;
+      if (!p || !isReady.current) return;
+      try {
+        const song  = currentSongRef.current;
+        const ownId = song?.source === 'jiosaavn' ? song._videoYoutubeId : song?.youtube_id;
+        if (!ownId || p.getVideoData?.()?.video_id !== ownId) return;
+        if (Math.abs(p.getCurrentTime() - audio.currentTime) > 1.2) p.seekTo(audio.currentTime, true);
+        if (!audio.paused && p.getPlayerState() !== 1) p.playVideo();
+      } catch {}
+    };
+    const handleSeeked = () => syncVideo();
     const handleTimeUpdate = () => {
       const cur   = audio.currentTime;
       const total = audio.duration;
+      if (Date.now() - lastVideoSync > 2000) { lastVideoSync = Date.now(); syncVideo(); }
       if (cur > 1) failureCountRef.current = 0; // genuinely playing — clear the failure streak
       if (total > 0) setProgress((cur / total) * 100);
       // Sync lyrics
@@ -381,12 +397,16 @@ const PlayerBar = () => {
 
     audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('play',       handlePlay);
+    audio.addEventListener('play',       syncVideo);
+    audio.addEventListener('seeked',     handleSeeked);
     audio.addEventListener('pause',      handlePause);
     audio.addEventListener('ended',      handleEnded);
     audio.addEventListener('error',      handleError);
     registerMediaSession();
 
     return () => {
+      audio.removeEventListener('play',       syncVideo);
+      audio.removeEventListener('seeked',     handleSeeked);
       audio.removeEventListener('timeupdate', handleTimeUpdate);
       audio.removeEventListener('play',       handlePlay);
       audio.removeEventListener('pause',      handlePause);
@@ -424,18 +444,19 @@ const PlayerBar = () => {
   // without this, a still-live unmuted IFrame keeps playing in the
   // background while native <audio> starts the new song simultaneously.
   useEffect(() => {
-    if (useNativeAudio && playerRef.current && isReady.current) {
-      try {
-        playerRef.current.pauseVideo();
-        playerRef.current.mute();
-      } catch {}
-      // Also stop its progress-tracking interval — otherwise it keeps
-      // firing every 300ms with the old paused video's frozen position,
-      // racing against native audio's timeupdate and causing the seek
-      // bar / lyrics highlight to flicker between two competing values.
-      stopProgressTracking();
-    }
-  }, [useNativeAudio, songKey]);
+    const p = playerRef.current;
+    if (!useNativeAudio || !p || !isReady.current) return;
+    // Native audio drives the seek bar and lyrics from here on.
+    stopProgressTracking();
+    try {
+      p.mute();
+      // Still showing THIS song's video (bridge handover): keep it playing, silent,
+      // as the video view. Anything else is a previous song's video: pause it.
+      const shownId = p.getVideoData?.()?.video_id;
+      const ownId   = isJioSaavn ? currentSong?._videoYoutubeId : currentSong?.youtube_id;
+      if (!isPlaying || !ownId || shownId !== ownId) p.pauseVideo();
+    } catch {}
+  }, [useNativeAudio, songKey]); // eslint-disable-line
 
   // ════════════════════════════════════════════════════════════════════
   // YOUTUBE IFRAME ENGINE
@@ -563,8 +584,9 @@ const PlayerBar = () => {
           },
           onStateChange: (e) => {
             // Native audio is the sound source: this player is only a silent video overlay now,
-            // so its play/pause/end events must not change the app's playback state.
-            if (nativeActiveRef.current && !muted) return;
+            // so its play/pause/end events must not change the app's playback state
+            // (or destroy the player when the video ends before a repeat restarts it).
+            if (nativeActiveRef.current) return;
             if (Date.now() < ignoreIframeEventsUntil.current) return;
             if (e.data === window.YT.PlayerState.PLAYING) {
               if (!muted) {
@@ -591,6 +613,12 @@ const PlayerBar = () => {
                 if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
               }
             } else if (e.data === window.YT.PlayerState.ENDED) {
+              if (!muted && repeatRef.current === 'one') {
+                // Repeat-one while the YouTube player is the sound source: restart it
+                playerRef.current?.seekTo(0, true);
+                playerRef.current?.playVideo();
+                return;
+              }
               stopProgressTracking();
               setProgress(0);
               try { playerRef.current?.destroy(); playerRef.current = null; isReady.current = false; } catch {}
@@ -1104,6 +1132,9 @@ const PlayerBar = () => {
 };
 
 export default PlayerBar;
+
+
+
 
 
 
